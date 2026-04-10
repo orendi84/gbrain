@@ -616,7 +616,14 @@ export class PostgresEngine implements BrainEngine {
 function validateSlug(slug: string): void {
   // Git is the system of record — slugs are lowercased repo-relative paths.
   // Only reject empty, path traversal (..), and leading slash.
-  if (!slug || /\.\./.test(slug) || /^\//.test(slug)) {
+  //
+  // The path-traversal check matches `..` only as a complete path component
+  // (at the start, between slashes, or at the end). A previous version used
+  // /\.\./.test(slug) which also rejected any substring of two dots, so
+  // filenames containing a literal ellipsis like "I got 99 problems..." or
+  // "How turtle shells evolved... twice" failed to import. Those are legal
+  // path components; only `..` as a navigation token should be rejected.
+  if (!slug || /(^|\/)\.\.(\/|$)/.test(slug) || /^\//.test(slug)) {
     throw new Error(`Invalid slug: "${slug}". Slugs cannot be empty, start with /, or contain path traversal.`);
   }
 }

@@ -7,7 +7,7 @@ import { slugifySegment, slugifyPath } from '../src/core/sync.ts';
 
 function validateSlug(slug: string): boolean {
   // Mirrors the logic in postgres-engine.ts
-  if (!slug || /\.\./.test(slug) || /^\//.test(slug)) return false;
+  if (!slug || /(^|\/)\.\.(\/|$)/.test(slug) || /^\//.test(slug)) return false;
   return true;
 }
 
@@ -147,5 +147,31 @@ describe('validateSlug (widened for any filename chars)', () => {
   test('accepts slug with dots (not traversal)', () => {
     expect(validateSlug('notes/v1.0.0')).toBe(true);
     expect(validateSlug('notes/file.name.md')).toBe(true);
+  });
+
+  // Regression for #N (this PR): the old regex /\.\./ rejected any two-dot
+  // substring, so filenames with literal ellipsis characters (common in
+  // YouTube transcript titles, TED talks, news headlines, etc.) were flagged
+  // as path traversal. Observed on a 7,910-file corpus: 64 imports failed,
+  // every single one with `...` in the title. Examples:
+  test('accepts filenames with literal ellipsis', () => {
+    expect(validateSlug('ted-talks/i got 99 problems... palsy is just one')).toBe(true);
+    expect(validateSlug('ted-ed-originals/how turtle shells evolved... twice')).toBe(true);
+    expect(validateSlug('huberman-lab/how playing sports benefits your body ... and your brain')).toBe(true);
+    expect(validateSlug('notes/this... that... the other')).toBe(true);
+  });
+
+  // Only `..` as a complete path component should be rejected. Two dots
+  // inside a component (e.g. `foo..bar`) are legal filename characters.
+  test('accepts `..` when embedded inside a path component', () => {
+    expect(validateSlug('channel/foo..bar')).toBe(true);
+    expect(validateSlug('channel/a..z')).toBe(true);
+  });
+
+  test('rejects `..` as a complete path component', () => {
+    expect(validateSlug('..')).toBe(false);
+    expect(validateSlug('foo/..')).toBe(false);
+    expect(validateSlug('foo/../bar')).toBe(false);
+    expect(validateSlug('foo/bar/../baz')).toBe(false);
   });
 });
