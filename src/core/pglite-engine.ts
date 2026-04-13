@@ -103,36 +103,68 @@ export class PGLiteEngine implements BrainEngine {
     const limit = filters?.limit || 100;
     const offset = filters?.offset || 0;
 
-    let result;
-    if (filters?.type && filters?.tag) {
-      result = await this.db.query(
-        `SELECT p.* FROM pages p
-         JOIN tags t ON t.page_id = p.id
-         WHERE p.type = $1 AND t.tag = $2
-         ORDER BY p.updated_at DESC LIMIT $3 OFFSET $4`,
-        [filters.type, filters.tag, limit, offset]
-      );
-    } else if (filters?.type) {
-      result = await this.db.query(
-        `SELECT * FROM pages WHERE type = $1
-         ORDER BY updated_at DESC LIMIT $2 OFFSET $3`,
-        [filters.type, limit, offset]
-      );
-    } else if (filters?.tag) {
-      result = await this.db.query(
-        `SELECT p.* FROM pages p
-         JOIN tags t ON t.page_id = p.id
-         WHERE t.tag = $1
-         ORDER BY p.updated_at DESC LIMIT $2 OFFSET $3`,
-        [filters.tag, limit, offset]
-      );
-    } else {
-      result = await this.db.query(
-        `SELECT * FROM pages
-         ORDER BY updated_at DESC LIMIT $1 OFFSET $2`,
-        [limit, offset]
-      );
+    // Normalize single `tag` into `tagsAll` so all tag filters share one code path.
+    const tagsAll: string[] = [
+      ...(filters?.tag ? [filters.tag] : []),
+      ...(filters?.tags_all ?? []),
+    ];
+    const tagsAny: string[] = filters?.tags_any ?? [];
+
+    // Fast path: no tag filters -> plain query (no joins).
+    if (tagsAll.length === 0 && tagsAny.length === 0) {
+      const result = filters?.type
+        ? await this.db.query(
+            `SELECT * FROM pages WHERE type = $1
+             ORDER BY updated_at DESC LIMIT $2 OFFSET $3`,
+            [filters.type, limit, offset]
+          )
+        : await this.db.query(
+            `SELECT * FROM pages
+             ORDER BY updated_at DESC LIMIT $1 OFFSET $2`,
+            [limit, offset]
+          );
+      return (result.rows as Record<string, unknown>[]).map(rowToPage);
     }
+
+    // Tag-filter path: GROUP BY + HAVING counts, composable across tags_all and tags_any.
+    const candidate = [...new Set([...tagsAll, ...tagsAny])];
+    const params: unknown[] = [candidate];
+    let paramIdx = 2;
+
+    let typeClause = '';
+    if (filters?.type) {
+      typeClause = `AND p.type = $${paramIdx}`;
+      params.push(filters.type);
+      paramIdx++;
+    }
+
+    let havingAll = 'TRUE';
+    if (tagsAll.length > 0) {
+      havingAll = `COUNT(DISTINCT t.tag) FILTER (WHERE t.tag = ANY($${paramIdx})) = $${paramIdx + 1}`;
+      params.push(tagsAll, tagsAll.length);
+      paramIdx += 2;
+    }
+
+    let havingAny = '';
+    if (tagsAny.length > 0) {
+      havingAny = `AND COUNT(DISTINCT t.tag) FILTER (WHERE t.tag = ANY($${paramIdx})) >= 1`;
+      params.push(tagsAny);
+      paramIdx++;
+    }
+
+    params.push(limit, offset);
+
+    const result = await this.db.query(
+      `SELECT p.* FROM pages p
+       JOIN tags t ON t.page_id = p.id
+       WHERE t.tag = ANY($1)
+       ${typeClause}
+       GROUP BY p.id
+       HAVING ${havingAll} ${havingAny}
+       ORDER BY p.updated_at DESC
+       LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`,
+      params
+    );
 
     return (result.rows as Record<string, unknown>[]).map(rowToPage);
   }
