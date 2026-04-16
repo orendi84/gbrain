@@ -59,6 +59,33 @@ Links pointing to pages that don't exist.
 Pages that mention entity names but don't have formal links.
 - Read compiled_truth from gbrain, extract entity mentions, create links in gbrain
 
+### Link graph extraction
+If link_count is 0 or low relative to page_count, run batch extraction:
+```bash
+gbrain extract links --dir ~/brain
+```
+This scans all markdown files for entity references, See Also sections, and
+frontmatter fields, then creates typed links in the database.
+
+### Timeline extraction
+If timeline_entry_count is 0, extract structured timeline from markdown:
+```bash
+gbrain extract timeline --dir ~/brain
+```
+Parses `- **YYYY-MM-DD** | Source — Summary` and `### YYYY-MM-DD — Title` formats.
+Note: extracted entries improve structured queries (`gbrain timeline`), not vector search.
+
+### Autopilot check
+Verify autopilot is running:
+```bash
+gbrain autopilot --status
+```
+If not running, install it:
+```bash
+gbrain autopilot --install --repo ~/brain
+```
+Autopilot runs sync, extract, and embed in a continuous loop with adaptive scheduling.
+
 ### Back-link enforcement
 Check that the back-linking iron law is being followed:
 - For each recently updated page, check if entities mentioned in it have

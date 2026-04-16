@@ -4,25 +4,35 @@ import type { ChunkInput } from '../core/types.ts';
 import { chunkText } from '../core/chunkers/recursive.ts';
 
 export async function runEmbed(engine: BrainEngine, args: string[]) {
-  const slug = args.find(a => !a.startsWith('--'));
+  const slugsIdx = args.indexOf('--slugs');
   const all = args.includes('--all');
   const stale = args.includes('--stale');
 
-  if (slug) {
-    await embedPage(engine, slug);
+  if (slugsIdx >= 0) {
+    // --slugs slug1 slug2 ... (embed specific pages)
+    const slugs = args.slice(slugsIdx + 1).filter(a => !a.startsWith('--'));
+    for (const s of slugs) {
+      try { await embedPage(engine, s); } catch (e: unknown) {
+        console.error(`  Error embedding ${s}: ${e instanceof Error ? e.message : e}`);
+      }
+    }
   } else if (all || stale) {
     await embedAll(engine, stale);
   } else {
-    console.error('Usage: gbrain embed [<slug>|--all|--stale]');
-    process.exit(1);
+    const slug = args.find(a => !a.startsWith('--'));
+    if (slug) {
+      await embedPage(engine, slug);
+    } else {
+      console.error('Usage: gbrain embed [<slug>|--all|--stale|--slugs s1 s2 ...]');
+      process.exit(1);
+    }
   }
 }
 
 async function embedPage(engine: BrainEngine, slug: string) {
   const page = await engine.getPage(slug);
   if (!page) {
-    console.error(`Page not found: ${slug}`);
-    process.exit(1);
+    throw new Error(`Page not found: ${slug}`);
   }
 
   // Get existing chunks or create new ones

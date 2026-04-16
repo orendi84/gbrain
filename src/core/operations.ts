@@ -458,7 +458,7 @@ const sync_brain: Operation = {
       full: (p.full as boolean) || false,
     });
   },
-  cliHints: { name: 'sync' },
+  cliHints: { name: 'sync', hidden: true },
 };
 
 // --- Raw Data ---

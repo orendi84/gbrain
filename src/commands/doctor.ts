@@ -69,7 +69,8 @@ export async function runDoctor(engine: BrainEngine | null, args: string[]) {
     if (!engine) {
       checks.push({ name: 'connection', status: 'warn', message: 'No database configured (filesystem checks only)' });
     }
-    outputResults(checks, jsonOutput);
+    const earlyFail1 = outputResults(checks, jsonOutput);
+    process.exit(earlyFail1 ? 1 : 0);
     return;
   }
 
@@ -80,7 +81,8 @@ export async function runDoctor(engine: BrainEngine | null, args: string[]) {
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     checks.push({ name: 'connection', status: 'fail', message: msg });
-    outputResults(checks, jsonOutput);
+    const earlyFail2 = outputResults(checks, jsonOutput);
+    process.exit(earlyFail2 ? 1 : 0);
     return;
   }
 
@@ -137,9 +139,9 @@ export async function runDoctor(engine: BrainEngine | null, args: string[]) {
     if (health.embed_coverage >= 0.9) {
       checks.push({ name: 'embeddings', status: 'ok', message: `${pct}% coverage, ${health.missing_embeddings} missing` });
     } else if (health.embed_coverage > 0) {
-      checks.push({ name: 'embeddings', status: 'warn', message: `${pct}% coverage, ${health.missing_embeddings} missing. Run: gbrain embed refresh` });
+      checks.push({ name: 'embeddings', status: 'warn', message: `${pct}% coverage, ${health.missing_embeddings} missing. Run: gbrain embed --stale` });
     } else {
-      checks.push({ name: 'embeddings', status: 'warn', message: 'No embeddings yet. Run: gbrain embed refresh' });
+      checks.push({ name: 'embeddings', status: 'warn', message: 'No embeddings yet. Run: gbrain embed --stale' });
     }
   } catch {
     checks.push({ name: 'embeddings', status: 'warn', message: 'Could not check embedding health' });
@@ -157,7 +159,18 @@ export async function runDoctor(engine: BrainEngine | null, args: string[]) {
     checks.push({ name: 'link_integrity', status: 'warn', message: 'Could not check link integrity' });
   }
 
-  outputResults(checks, jsonOutput);
+  const hasFail = outputResults(checks, jsonOutput);
+
+  // Features teaser (non-JSON, non-failing only)
+  if (!jsonOutput && !hasFail && engine) {
+    try {
+      const { featuresTeaserForDoctor } = await import('./features.ts');
+      const teaser = await featuresTeaserForDoctor(engine);
+      if (teaser) console.log(`\n${teaser}`);
+    } catch { /* best-effort */ }
+  }
+
+  process.exit(hasFail ? 1 : 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -217,23 +230,22 @@ function checkSkillConformance(skillsDir: string): Check {
   }
 }
 
-function outputResults(checks: Check[], json: boolean) {
+function outputResults(checks: Check[], json: boolean): boolean {
+  const hasFail = checks.some(c => c.status === 'fail');
+  const hasWarn = checks.some(c => c.status === 'warn');
+
+  // Compute composite health score (0-100)
+  let score = 100;
+  for (const c of checks) {
+    if (c.status === 'fail') score -= 20;
+    else if (c.status === 'warn') score -= 5;
+  }
+  score = Math.max(0, score);
+
   if (json) {
-    const hasFail = checks.some(c => c.status === 'fail');
-    const hasWarn = checks.some(c => c.status === 'warn');
     const status = hasFail ? 'unhealthy' : hasWarn ? 'warnings' : 'healthy';
-
-    // Compute composite health score (0-100)
-    let score = 100;
-    for (const c of checks) {
-      if (c.status === 'fail') score -= 20;
-      else if (c.status === 'warn') score -= 5;
-    }
-    score = Math.max(0, score);
-
     console.log(JSON.stringify({ schema_version: 2, status, health_score: score, checks }));
-    process.exit(hasFail ? 1 : 0);
-    return;
+    return hasFail;
   }
 
   console.log('\nGBrain Health Check');
@@ -241,7 +253,6 @@ function outputResults(checks: Check[], json: boolean) {
   for (const c of checks) {
     const icon = c.status === 'ok' ? 'OK' : c.status === 'warn' ? 'WARN' : 'FAIL';
     console.log(`  [${icon}] ${c.name}: ${c.message}`);
-    // Print resolver issues with actions
     if (c.issues) {
       for (const issue of c.issues) {
         console.log(`    → ${issue.type.toUpperCase()}: ${issue.skill}`);
@@ -250,16 +261,6 @@ function outputResults(checks: Check[], json: boolean) {
     }
   }
 
-  // Composite health score
-  let score = 100;
-  for (const c of checks) {
-    if (c.status === 'fail') score -= 20;
-    else if (c.status === 'warn') score -= 5;
-  }
-  score = Math.max(0, score);
-
-  const hasFail = checks.some(c => c.status === 'fail');
-  const hasWarn = checks.some(c => c.status === 'warn');
   if (hasFail) {
     console.log(`\nHealth score: ${score}/100. Failed checks found.`);
   } else if (hasWarn) {
@@ -267,5 +268,5 @@ function outputResults(checks: Check[], json: boolean) {
   } else {
     console.log(`\nHealth score: ${score}/100. All checks passed.`);
   }
-  process.exit(hasFail ? 1 : 0);
+  return hasFail;
 }

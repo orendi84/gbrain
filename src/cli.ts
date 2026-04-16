@@ -18,7 +18,7 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval']);
+const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot']);
 
 async function main() {
   const args = process.argv.slice(2);
@@ -356,6 +356,26 @@ async function handleCliOnly(command: string, args: string[]) {
         await runEvalCommand(engine, args);
         break;
       }
+      case 'sync': {
+        const { runSync } = await import('./commands/sync.ts');
+        await runSync(engine, args);
+        break;
+      }
+      case 'extract': {
+        const { runExtract } = await import('./commands/extract.ts');
+        await runExtract(engine, args);
+        break;
+      }
+      case 'features': {
+        const { runFeatures } = await import('./commands/features.ts');
+        await runFeatures(engine, args);
+        break;
+      }
+      case 'autopilot': {
+        const { runAutopilot } = await import('./commands/autopilot.ts');
+        await runAutopilot(engine, args);
+        return; // autopilot doesn't disconnect (long-running)
+      }
     }
   } finally {
     if (command !== 'serve') await engine.disconnect();
@@ -424,6 +444,8 @@ SEARCH
 IMPORT/EXPORT
   import <dir> [--no-embed]          Import markdown directory
   sync [--repo <path>] [flags]       Git-to-brain incremental sync
+  sync --watch [--interval N]        Continuous sync (loops until stopped)
+  sync --install-cron                Install persistent sync daemon
   export [--dir ./out/]              Export to markdown
 
 FILES
@@ -453,6 +475,7 @@ TIMELINE
   timeline-add <slug> <date> <text>  Add timeline entry
 
 TOOLS
+  extract <links|timeline|all> [dir] Extract links/timeline from markdown into DB
   publish <page.md> [--password]     Shareable HTML (strips private data, optional AES-256)
   check-backlinks <check|fix> [dir]  Find/fix missing back-links across brain
   lint <dir|file> [--fix]            Catch LLM artifacts, placeholder dates, bad frontmatter
@@ -463,6 +486,8 @@ ADMIN
   health                             Brain health dashboard
   history <slug>                     Page version history
   revert <slug> <version-id>         Revert to version
+  features [--json] [--auto-fix]     Scan usage + recommend unused features
+  autopilot [--repo] [--interval N]  Self-maintaining brain daemon
   config [show|get|set] <key> [val]  Brain config
   serve                              MCP server (stdio)
   call <tool> '<json>'               Raw tool invocation

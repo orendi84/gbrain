@@ -42,9 +42,12 @@ markdown files (tool-agnostic, work with both CLI and plugin contexts).
 - `src/core/transcription.ts` — Audio transcription: Groq Whisper (default), OpenAI fallback, ffmpeg segmentation for >25MB
 - `src/core/enrichment-service.ts` — Global enrichment service: entity slug generation, tier auto-escalation, batch throttling
 - `src/core/data-research.ts` — Recipe validation, field extraction (MRR/ARR regex), dedup, tracker parsing, HTML stripping
+- `src/commands/extract.ts` — `gbrain extract links|timeline|all`: batch link/timeline extraction from markdown
+- `src/commands/features.ts` — `gbrain features --json --auto-fix`: usage scan + feature adoption salesman
+- `src/commands/autopilot.ts` — `gbrain autopilot --install`: self-maintaining brain daemon (sync+extract+embed)
 - `src/mcp/server.ts` — MCP stdio server (generated from operations)
 - `src/commands/auth.ts` — Standalone token management (create/list/revoke/test)
-- `src/commands/upgrade.ts` — Self-update CLI with post-upgrade feature discovery
+- `src/commands/upgrade.ts` — Self-update CLI with post-upgrade feature discovery + features hook
 - `src/core/schema-embedded.ts` — AUTO-GENERATED from schema.sql (run `bun run build:schema`)
 - `src/schema.sql` — Full Postgres + pgvector DDL (source of truth, generates schema-embedded.ts)
 - `src/commands/integrations.ts` — Standalone integration recipe management (no DB needed)
@@ -133,7 +136,9 @@ parity), `test/cli.test.ts` (CLI structure), `test/config.test.ts` (config redac
 `test/fail-improve.test.ts` (deterministic/LLM cascade, JSONL logging, test generation, rotation),
 `test/transcription.test.ts` (provider detection, format validation, API key errors),
 `test/enrichment-service.test.ts` (entity slugification, extraction, tier escalation),
-`test/data-research.test.ts` (recipe validation, MRR/ARR extraction, dedup, tracker parsing, HTML stripping).
+`test/data-research.test.ts` (recipe validation, MRR/ARR extraction, dedup, tracker parsing, HTML stripping),
+`test/extract.test.ts` (link extraction, timeline extraction, frontmatter parsing, directory type inference),
+`test/features.test.ts` (feature scanning, brain_score calculation, CLI routing, persistence).
 
 E2E tests (`test/e2e/`): Run against real Postgres+pgvector. Require `DATABASE_URL`.
 - `bun run test:e2e` runs Tier 1 (mechanical, all operations, no API keys)

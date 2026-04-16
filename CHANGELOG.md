@@ -2,6 +2,34 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.10.1] - 2026-04-15
+
+### Fixed
+
+- **`gbrain sync --watch` actually works now.** The watch loop existed but was never called because the CLI routed sync through the operation layer (single-pass only). Now sync routes through the CLI path that knows about `--watch` and `--interval`. Your cron workaround is no longer needed.
+
+- **Sync auto-embeds your pages.** After syncing, gbrain now embeds the changed pages automatically. No more "I synced but search can't find my new page." Opt out with `--no-embed`. Large syncs (100+ pages) defer embedding to `gbrain embed --stale`.
+
+- **First sync no longer repeats forever.** `performFullSync` wasn't saving its checkpoint. Fixed: sync state persists after full import so the next sync is incremental.
+
+- **`dead_links` metric is consistent across engines.** Postgres was counting empty-content chunks instead of dangling links. Now both engines count the same thing: links pointing to non-existent pages.
+
+- **Doctor recommends the right embed command.** Was suggesting `gbrain embed refresh` (doesn't exist). Now correctly says `gbrain embed --stale`.
+
+### Added
+
+- **`gbrain extract links|timeline|all`** builds your link graph and structured timeline from existing markdown. Scans for markdown links, frontmatter fields (company, investors, attendees), and See Also sections. Infers link types from directory structure. Parses both bullet (`- **YYYY-MM-DD** | Source — Summary`) and header (`### YYYY-MM-DD — Title`) timeline formats. Runs automatically after every sync.
+
+- **`gbrain features --json --auto-fix`** scans your brain and tells you what you're not using, with your own numbers. Priority 1 (data quality): missing embeddings, dead links. Priority 2 (unused features): zero links, zero timeline, low coverage, unconfigured integrations. Agents run `--auto-fix` to handle everything automatically.
+
+- **`gbrain autopilot --install`** sets up a persistent daemon that runs sync, extract, and embed in a continuous loop. Health-based scheduling: brain score >= 90 slows down, < 70 speeds up. Installs as a launchd service (macOS) or crontab entry (Linux). One command, brain maintains itself forever.
+
+- **Brain health score (0-100)** in `gbrain health` and `gbrain doctor`. Weighted composite of embed coverage, link density, timeline coverage, orphan pages, and dead links. Agents use it as a health gate.
+
+- **`gbrain embed --slugs`** embeds specific pages by slug. Used internally by sync auto-embed to target just the changed pages.
+
+- **Instruction layer for agents.** RESOLVER.md routing entries, maintain skill sections, and setup skill phase for extract, features, and autopilot. Without these, agents would never discover the new commands.
+
 ## [0.10.0] - 2026-04-14
 
 ### Added
