@@ -100,11 +100,26 @@ data corruption** bug in my own merge + re-verify scripts.
 - **Memory saved**: `~/.claude/projects/-Users-gergoorendi/memory/feedback_postgres_jsonb_double_encode.md`
   so this doesn't repeat.
 
+### Late afternoon addendum: Tier B edge-2 micro-sweep
+
+Fixing the jsonb corruption exposed 4 previously-invisible hub rows (e.g.
+JPMorgan Chase at 4 edges) that my original hub reverify missed because
+their `enrichment_source` was buried inside the corrupted jsonb string.
+Plus 8 rows at exactly 2 edges. Total: 12 rows.
+
+- **Run**: concurrency 5, budget cap $5, wall cap 5 min. Finished 12/12 in
+  **13.3s** at **$0.3213**. Script at `scripts/cleanup-tier-b-edge2-sweep.ts`.
+- **Post-state**: no_search=1,760 (unverified), openai_search=621,
+  haiku_search=**124**. Zero remaining unverified rows with edges >= 2.
+- **Coverage rule satisfied**: every Tier B non-noise company with inbound
+  edges >= 2 is now `enrichment_verified=true`.
+
 What remains open from the original doc:
 1. **4.1 step 2 trust-boundary gate** - still blocked on the CRM surface existing.
-2. **4.2 paid top-N re-verification** - **PARTIALLY CLOSED**: 35 highest-signal
-   hubs (edges >= 3) are now verified. 1,100+ non-hub single-edge Tier B rows
-   remain at `verified:false`; the doc's "do nothing" default still applies.
+2. **4.2 paid top-N re-verification** - **FULLY CLOSED for edge-weighted hubs**:
+   every non-noise Tier B row with inbound edges >= 2 is verified. The 1,097
+   single-edge stubs remain at `verified:false`; the doc's "do nothing" default
+   still applies since verification value per row is low without a CRM surface.
 
 Nothing else from the original section 4 list is actionable.
 
