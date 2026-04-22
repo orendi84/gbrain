@@ -1,5 +1,5 @@
 // Page types
-export type PageType = 'person' | 'company' | 'mandate' | 'project' | 'concept' | 'source' | 'media' | 'knowledge';
+export type PageType = 'person' | 'company' | 'mandate' | 'project' | 'concept' | 'source' | 'media' | 'knowledge' | 'deal' | 'yc' | 'civic' | 'writing' | 'analysis' | 'guide' | 'hardware' | 'architecture' | 'meeting' | 'note';
 
 export interface Page {
   id: number;
