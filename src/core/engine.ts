@@ -50,6 +50,9 @@ export function clampSearchLimit(limit: number | undefined, defaultLimit = 20, c
 }
 
 export interface BrainEngine {
+  /** Discriminator: lets migrations and other consumers branch on engine kind without instanceof + dynamic imports. */
+  readonly kind: 'postgres' | 'pglite';
+
   // Lifecycle
   connect(config: EngineConfig): Promise<void>;
   disconnect(): Promise<void>;
@@ -149,6 +152,13 @@ export interface BrainEngine {
    * Slugs with zero inbound links are present in the map with value 0.
    */
   getBacklinkCounts(slugs: string[]): Promise<Map<string, number>>;
+  /**
+   * Return every page with no inbound links (from any source).
+   * Domain comes from the frontmatter `domain` field (null if unset).
+   * The caller filters pseudo-pages + derives display domain.
+   * Used by `gbrain orphans` and `runCycle`'s orphan sweep phase.
+   */
+  findOrphanPages(): Promise<Array<{ slug: string; title: string; domain: string | null }>>;
 
   // Tags
   addTag(slug: string, tag: string): Promise<void>;

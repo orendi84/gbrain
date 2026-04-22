@@ -1,7 +1,7 @@
 # Production Benchmark: Minions vs OpenClaw Sub-agents (Real Deployment)
 
 **Date:** 2026-04-18
-**Environment:** Wintermute on Render (ephemeral container, Supabase Postgres)
+**Environment:** Garry's OpenClaw on Render (ephemeral container, Supabase Postgres)
 **GBrain:** v0.11.0 (minions-jobs branch)
 **OpenClaw:** 2026.4.10
 **Brain:** 45,798 pages, 98K chunks, 25K links, 79K timeline entries

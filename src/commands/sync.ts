@@ -12,6 +12,8 @@ import {
   acknowledgeSyncFailures,
 } from '../core/sync.ts';
 import type { SyncManifest } from '../core/sync.ts';
+import { createProgress } from '../core/progress.ts';
+import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 
 export interface SyncResult {
   status: 'up_to_date' | 'synced' | 'first_sync' | 'dry_run' | 'blocked_by_failures';
@@ -22,6 +24,8 @@ export interface SyncResult {
   deleted: number;
   renamed: number;
   chunksCreated: number;
+  /** Pages re-embedded during this sync's auto-embed step. 0 if --no-embed or skipped. */
+  embedded: number;
   pagesAffected: string[];
   failedFiles?: number; // count of parse failures (Bug 9)
 }
@@ -114,6 +118,7 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
       toCommit: headCommit,
       added: 0, modified: 0, deleted: 0, renamed: 0,
       chunksCreated: 0,
+      embedded: 0,
       pagesAffected: [],
     };
   }
@@ -163,6 +168,7 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
       deleted: filtered.deleted.length,
       renamed: filtered.renamed.length,
       chunksCreated: 0,
+      embedded: 0,
       pagesAffected: [],
     };
   }
@@ -177,6 +183,7 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
       toCommit: headCommit,
       added: 0, modified: 0, deleted: 0, renamed: 0,
       chunksCreated: 0,
+      embedded: 0,
       pagesAffected: [],
     };
   }
@@ -190,29 +197,43 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
   let chunksCreated = 0;
   const start = Date.now();
 
+  // Per-file progress on stderr so agents see each step of a big sync.
+  // Phases: sync.deletes, sync.renames, sync.imports.
+  const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
+
   // Process deletes first (prevents slug conflicts)
-  for (const path of filtered.deleted) {
-    const slug = pathToSlug(path);
-    await engine.deletePage(slug);
-    pagesAffected.push(slug);
+  if (filtered.deleted.length > 0) {
+    progress.start('sync.deletes', filtered.deleted.length);
+    for (const path of filtered.deleted) {
+      const slug = pathToSlug(path);
+      await engine.deletePage(slug);
+      pagesAffected.push(slug);
+      progress.tick(1, slug);
+    }
+    progress.finish();
   }
 
   // Process renames (updateSlug preserves page_id, chunks, embeddings)
-  for (const { from, to } of filtered.renamed) {
-    const oldSlug = pathToSlug(from);
-    const newSlug = pathToSlug(to);
-    try {
-      await engine.updateSlug(oldSlug, newSlug);
-    } catch {
-      // Slug doesn't exist or collision, treat as add
+  if (filtered.renamed.length > 0) {
+    progress.start('sync.renames', filtered.renamed.length);
+    for (const { from, to } of filtered.renamed) {
+      const oldSlug = pathToSlug(from);
+      const newSlug = pathToSlug(to);
+      try {
+        await engine.updateSlug(oldSlug, newSlug);
+      } catch {
+        // Slug doesn't exist or collision, treat as add
+      }
+      // Reimport at new path (picks up content changes)
+      const filePath = join(repoPath, to);
+      if (existsSync(filePath)) {
+        const result = await importFile(engine, filePath, to, { noEmbed });
+        if (result.status === 'imported') chunksCreated += result.chunks;
+      }
+      pagesAffected.push(newSlug);
+      progress.tick(1, newSlug);
     }
-    // Reimport at new path (picks up content changes)
-    const filePath = join(repoPath, to);
-    if (existsSync(filePath)) {
-      const result = await importFile(engine, filePath, to, { noEmbed });
-      if (result.status === 'imported') chunksCreated += result.chunks;
-    }
-    pagesAffected.push(newSlug);
+    progress.finish();
   }
 
   // Process adds and modifies.
@@ -225,24 +246,37 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
   // ep_poll whenever the diff crosses the old > 10 threshold that used to
   // trigger the outer wrap. Per-file atomicity is also the right granularity:
   // one file's failure should not roll back the others' successful imports.
+  //
+  // v0.15.2: per-file progress on stderr via the shared reporter.
+  // Bug 9: per-file failures captured in `failedFiles` so the caller can
+  // gate `sync.last_commit` advancement and record recoverable errors.
   const failedFiles: Array<{ path: string; error: string; line?: number }> = [];
-  for (const path of [...filtered.added, ...filtered.modified]) {
-    const filePath = join(repoPath, path);
-    if (!existsSync(filePath)) continue;
-    try {
-      const result = await importFile(engine, filePath, path, { noEmbed });
-      if (result.status === 'imported') {
-        chunksCreated += result.chunks;
-        pagesAffected.push(result.slug);
-      } else if (result.status === 'skipped' && (result as any).error) {
-        // importFile returned a non-throw skip with a reason
-        failedFiles.push({ path, error: String((result as any).error) });
+  const addsAndMods = [...filtered.added, ...filtered.modified];
+  if (addsAndMods.length > 0) {
+    progress.start('sync.imports', addsAndMods.length);
+    for (const path of addsAndMods) {
+      const filePath = join(repoPath, path);
+      if (!existsSync(filePath)) {
+        progress.tick(1, `skip:${path}`);
+        continue;
       }
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.error(`  Warning: skipped ${path}: ${msg}`);
-      failedFiles.push({ path, error: msg });
+      try {
+        const result = await importFile(engine, filePath, path, { noEmbed });
+        if (result.status === 'imported') {
+          chunksCreated += result.chunks;
+          pagesAffected.push(result.slug);
+        } else if (result.status === 'skipped' && (result as any).error) {
+          // importFile returned a non-throw skip with a reason.
+          failedFiles.push({ path, error: String((result as any).error) });
+        }
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(`  Warning: skipped ${path}: ${msg}`);
+        failedFiles.push({ path, error: msg });
+      }
+      progress.tick(1, path);
     }
+    progress.finish();
   }
 
   const elapsed = Date.now() - start;
@@ -272,6 +306,7 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
         deleted: filtered.deleted.length,
         renamed: filtered.renamed.length,
         chunksCreated,
+        embedded: 0,
         pagesAffected,
         failedFiles: failedFiles.length,
       };
@@ -309,10 +344,15 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
   }
 
   // Auto-embed (skip for large syncs — embedding calls OpenAI)
+  let embedded = 0;
   if (!noEmbed && pagesAffected.length > 0 && pagesAffected.length <= 100) {
     try {
       const { runEmbed } = await import('./embed.ts');
       await runEmbed(engine, ['--slugs', ...pagesAffected]);
+      // Before commit 2 lands: runEmbed is void. Best estimate is pagesAffected,
+      // since runEmbed re-embeds every requested slug. Commit 2 sharpens this
+      // with EmbedResult.embedded.
+      embedded = pagesAffected.length;
     } catch { /* embedding is best-effort */ }
   } else if (noEmbed || totalChanges > 100) {
     console.log(`Text imported. Run 'gbrain embed --stale' to generate embeddings.`);
@@ -327,6 +367,7 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
     deleted: filtered.deleted.length,
     renamed: filtered.renamed.length,
     chunksCreated,
+    embedded,
     pagesAffected,
   };
 }
@@ -337,6 +378,33 @@ async function performFullSync(
   headCommit: string,
   opts: SyncOpts,
 ): Promise<SyncResult> {
+  // Dry-run: walk the repo, count syncable files, return without writing.
+  // Fixes the silent-write-on-dry-run bug where performFullSync called
+  // runImport unconditionally regardless of opts.dryRun.
+  if (opts.dryRun) {
+    const { collectMarkdownFiles } = await import('./import.ts');
+    const allFiles = collectMarkdownFiles(repoPath);
+    const syncableRelPaths = allFiles
+      .map(abs => relative(repoPath, abs))
+      .filter(rel => isSyncable(rel));
+    console.log(
+      `Full-sync dry run: ${syncableRelPaths.length} file(s) would be imported ` +
+      `from ${repoPath} @ ${headCommit.slice(0, 8)}.`,
+    );
+    return {
+      status: 'dry_run',
+      fromCommit: null,
+      toCommit: headCommit,
+      added: syncableRelPaths.length,
+      modified: 0,
+      deleted: 0,
+      renamed: 0,
+      chunksCreated: 0,
+      embedded: 0,
+      pagesAffected: [],
+    };
+  }
+
   console.log(`Running full import of ${repoPath}...`);
   const { runImport } = await import('./import.ts');
   const importArgs = [repoPath];
@@ -362,6 +430,7 @@ async function performFullSync(
         toCommit: headCommit,
         added: 0, modified: 0, deleted: 0, renamed: 0,
         chunksCreated: result.chunksCreated,
+        embedded: 0,
         pagesAffected: [],
         failedFiles: result.failures.length,
       };
@@ -375,11 +444,15 @@ async function performFullSync(
   await engine.setConfig('sync.last_run', new Date().toISOString());
   await engine.setConfig('sync.repo_path', repoPath);
 
-  // Full sync doesn't track pagesAffected, so fall back to embed --stale
+  // Full sync doesn't track pagesAffected, so fall back to embed --stale.
+  // Before commit 2: runEmbed is void; use result.imported as best estimate of
+  // pages touched. Commit 2 sharpens this with real EmbedResult counts.
+  let embedded = 0;
   if (!opts.noEmbed) {
     try {
       const { runEmbed } = await import('./embed.ts');
       await runEmbed(engine, ['--stale']);
+      embedded = result.imported;
     } catch { /* embedding is best-effort */ }
   }
 
@@ -387,8 +460,12 @@ async function performFullSync(
     status: 'first_sync',
     fromCommit: null,
     toCommit: headCommit,
-    added: 0, modified: 0, deleted: 0, renamed: 0,
-    chunksCreated: 0,
+    added: result.imported,
+    modified: 0,
+    deleted: 0,
+    renamed: 0,
+    chunksCreated: result.chunksCreated,
+    embedded,
     pagesAffected: [],
   };
 }
@@ -460,10 +537,11 @@ function printSyncResult(result: SyncResult) {
     case 'synced':
       console.log(`Synced ${result.fromCommit?.slice(0, 8)}..${result.toCommit.slice(0, 8)}:`);
       console.log(`  +${result.added} added, ~${result.modified} modified, -${result.deleted} deleted, R${result.renamed} renamed`);
-      console.log(`  ${result.chunksCreated} chunks created`);
+      console.log(`  ${result.chunksCreated} chunks created${result.embedded > 0 ? `, ${result.embedded} pages embedded` : ''}`);
       break;
     case 'first_sync':
       console.log(`First sync complete. Checkpoint: ${result.toCommit.slice(0, 8)}`);
+      console.log(`  ${result.added} file(s) imported, ${result.chunksCreated} chunks${result.embedded > 0 ? `, ${result.embedded} pages embedded` : ''}`);
       break;
     case 'dry_run':
       break; // already printed in performSync

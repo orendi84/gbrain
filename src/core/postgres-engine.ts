@@ -4,7 +4,7 @@ import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import { runMigrations } from './migrate.ts';
 import { SCHEMA_SQL } from './schema-embedded.ts';
 import type {
-  Page, PageInput, PageFilters,
+  Page, PageInput, PageFilters, PageType,
   Chunk, ChunkInput,
   SearchResult, SearchOpts,
   Link, GraphNode, GraphPath,
@@ -20,6 +20,7 @@ import * as db from './db.ts';
 import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding } from './utils.ts';
 
 export class PostgresEngine implements BrainEngine {
+  readonly kind = 'postgres' as const;
   private _sql: ReturnType<typeof postgres> | null = null;
 
   // Instance connection (for workers) or fall back to module global (backward compat)
@@ -37,12 +38,21 @@ export class PostgresEngine implements BrainEngine {
       const url = config.database_url;
       if (!url) throw new GBrainError('No database URL', 'database_url is missing', 'Provide --url');
       const size = Math.min(config.poolSize, db.resolvePoolSize(config.poolSize));
-      this._sql = postgres(url, {
+      // Honor PgBouncer transaction-mode detection on worker-instance pools too.
+      // Without this, `gbrain jobs work` against a Supabase pooler URL hits
+      // "prepared statement does not exist" under load just like the module
+      // singleton did before v0.15.4.
+      const prepare = db.resolvePrepare(url);
+      const opts: Record<string, unknown> = {
         max: size,
         idle_timeout: 20,
         connect_timeout: 10,
         types: { bigint: postgres.BigInt },
-      });
+      };
+      if (typeof prepare === 'boolean') {
+        opts.prepare = prepare;
+      }
+      this._sql = postgres(url, opts);
       await this._sql`SELECT 1`;
     } else {
       // Module-level singleton (backward compat for CLI main engine)
@@ -85,7 +95,7 @@ export class PostgresEngine implements BrainEngine {
       Object.defineProperty(txEngine, 'sql', { get: () => tx });
       Object.defineProperty(txEngine, '_sql', { value: tx as unknown as ReturnType<typeof postgres>, writable: false });
       return fn(txEngine);
-    });
+    }) as Promise<T>;
   }
 
   // Pages CRUD
@@ -107,7 +117,7 @@ export class PostgresEngine implements BrainEngine {
 
     const rows = await sql`
       INSERT INTO pages (slug, type, title, compiled_truth, timeline, frontmatter, content_hash, updated_at)
-      VALUES (${slug}, ${page.type}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter)}, ${hash}, now())
+      VALUES (${slug}, ${page.type}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now())
       ON CONFLICT (slug) DO UPDATE SET
         type = EXCLUDED.type,
         title = EXCLUDED.title,
@@ -196,7 +206,7 @@ export class PostgresEngine implements BrainEngine {
   async getAllSlugs(): Promise<Set<string>> {
     const sql = this.sql;
     const rows = await sql`SELECT slug FROM pages`;
-    return new Set(rows.map((r: { slug: string }) => r.slug));
+    return new Set(rows.map((r) => r.slug as string));
   }
 
   async resolveSlugs(partial: string): Promise<string[]> {
@@ -214,7 +224,7 @@ export class PostgresEngine implements BrainEngine {
       ORDER BY sim DESC
       LIMIT 5
     `;
-    return fuzzy.map((r: { slug: string }) => r.slug);
+    return fuzzy.map((r) => r.slug as string);
   }
 
   // Search
@@ -375,7 +385,7 @@ export class PostgresEngine implements BrainEngine {
          model = COALESCE(EXCLUDED.model, content_chunks.model),
          token_count = EXCLUDED.token_count,
          embedded_at = COALESCE(EXCLUDED.embedded_at, content_chunks.embedded_at)`,
-      params,
+      params as Parameters<typeof sql.unsafe>[1],
     );
   }
 
@@ -387,7 +397,7 @@ export class PostgresEngine implements BrainEngine {
       WHERE p.slug = ${slug}
       ORDER BY cc.chunk_index
     `;
-    return rows.map(rowToChunk);
+    return rows.map((r) => rowToChunk(r as Record<string, unknown>));
   }
 
   async deleteChunks(slug: string): Promise<void> {
@@ -724,10 +734,26 @@ export class PostgresEngine implements BrainEngine {
       WHERE p.slug = ANY(${slugs}::text[])
       GROUP BY p.slug
     `;
-    for (const r of rows as { slug: string; cnt: number }[]) {
+    for (const r of rows as unknown as { slug: string; cnt: number }[]) {
       result.set(r.slug, Number(r.cnt));
     }
     return result;
+  }
+
+  async findOrphanPages(): Promise<Array<{ slug: string; title: string; domain: string | null }>> {
+    const sql = this.sql;
+    const rows = await sql`
+      SELECT
+        p.slug,
+        COALESCE(p.title, p.slug) AS title,
+        p.frontmatter->>'domain' AS domain
+      FROM pages p
+      WHERE NOT EXISTS (
+        SELECT 1 FROM links l WHERE l.to_page_id = p.id
+      )
+      ORDER BY p.slug
+    `;
+    return rows as unknown as Array<{ slug: string; title: string; domain: string | null }>;
   }
 
   // Tags
@@ -760,7 +786,7 @@ export class PostgresEngine implements BrainEngine {
       WHERE page_id = (SELECT id FROM pages WHERE slug = ${slug})
       ORDER BY tag
     `;
-    return rows.map((r: { tag: string }) => r.tag);
+    return rows.map((r) => r.tag as string);
   }
 
   // Timeline
@@ -845,7 +871,7 @@ export class PostgresEngine implements BrainEngine {
     const sql = this.sql;
     const result = await sql`
       INSERT INTO raw_data (page_id, source, data)
-      SELECT id, ${source}, ${sql.json(data as Record<string, unknown>)}
+      SELECT id, ${source}, ${sql.json(data as Parameters<typeof sql.json>[0])}
       FROM pages WHERE slug = ${slug}
       ON CONFLICT (page_id, source) DO UPDATE SET
         data = EXCLUDED.data,
@@ -1018,7 +1044,7 @@ export class PostgresEngine implements BrainEngine {
       dead_links: deadLinks,
       link_coverage: Number(h.link_coverage),
       timeline_coverage: Number(h.timeline_coverage),
-      most_connected: (connected as { slug: string; link_count: number }[]).map(c => ({
+      most_connected: (connected as unknown as { slug: string; link_count: number }[]).map(c => ({
         slug: c.slug,
         link_count: Number(c.link_count),
       })),
@@ -1091,11 +1117,11 @@ export class PostgresEngine implements BrainEngine {
       WHERE p.slug = ${slug}
       ORDER BY cc.chunk_index
     `;
-    return rows.map((r: Record<string, unknown>) => rowToChunk(r, true));
+    return rows.map((r) => rowToChunk(r as Record<string, unknown>, true));
   }
 
   async executeRaw<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]> {
     const conn = this.sql;
-    return conn.unsafe(sql, params) as unknown as T[];
+    return conn.unsafe(sql, params as Parameters<typeof conn.unsafe>[1]) as unknown as T[];
   }
 }

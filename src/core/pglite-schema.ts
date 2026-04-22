@@ -185,7 +185,7 @@ CREATE TABLE IF NOT EXISTS minion_jobs (
   backoff_delay    INTEGER     NOT NULL DEFAULT 1000,
   backoff_jitter   REAL        NOT NULL DEFAULT 0.2,
   stalled_counter  INTEGER     NOT NULL DEFAULT 0,
-  max_stalled      INTEGER     NOT NULL DEFAULT 3,
+  max_stalled      INTEGER     NOT NULL DEFAULT 5,
   lock_token       TEXT,
   lock_until       TIMESTAMPTZ,
   delay_until      TIMESTAMPTZ,
@@ -263,6 +263,68 @@ CREATE TABLE IF NOT EXISTS minion_attachments (
 CREATE INDEX IF NOT EXISTS idx_minion_attachments_job ON minion_attachments (job_id);
 -- NOTE: SET STORAGE EXTERNAL is omitted on PGLite; it's a Postgres TOAST optimization
 -- and PGLite may not support it. Postgres path applies it via migration v7.
+
+-- ============================================================
+-- Subagent runtime (v0.16.0) — durable LLM loops
+-- ============================================================
+CREATE TABLE IF NOT EXISTS subagent_messages (
+  id                  BIGSERIAL PRIMARY KEY,
+  job_id              BIGINT      NOT NULL REFERENCES minion_jobs(id) ON DELETE CASCADE,
+  message_idx         INTEGER     NOT NULL,
+  role                TEXT        NOT NULL,
+  content_blocks      JSONB       NOT NULL,
+  tokens_in           INTEGER,
+  tokens_out          INTEGER,
+  tokens_cache_read   INTEGER,
+  tokens_cache_create INTEGER,
+  model               TEXT,
+  ended_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT uniq_subagent_messages_idx UNIQUE (job_id, message_idx),
+  CONSTRAINT chk_subagent_messages_role CHECK (role IN ('user','assistant'))
+);
+CREATE INDEX IF NOT EXISTS idx_subagent_messages_job ON subagent_messages (job_id, message_idx);
+
+CREATE TABLE IF NOT EXISTS subagent_tool_executions (
+  id           BIGSERIAL PRIMARY KEY,
+  job_id       BIGINT      NOT NULL REFERENCES minion_jobs(id) ON DELETE CASCADE,
+  message_idx  INTEGER     NOT NULL,
+  tool_use_id  TEXT        NOT NULL,
+  tool_name    TEXT        NOT NULL,
+  input        JSONB       NOT NULL,
+  status       TEXT        NOT NULL,
+  output       JSONB,
+  error        TEXT,
+  started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  ended_at     TIMESTAMPTZ,
+  CONSTRAINT uniq_subagent_tools_use_id UNIQUE (job_id, tool_use_id),
+  CONSTRAINT chk_subagent_tools_status CHECK (status IN ('pending','complete','failed'))
+);
+CREATE INDEX IF NOT EXISTS idx_subagent_tools_job ON subagent_tool_executions (job_id, status);
+
+CREATE TABLE IF NOT EXISTS subagent_rate_leases (
+  id            BIGSERIAL PRIMARY KEY,
+  key           TEXT        NOT NULL,
+  owner_job_id  BIGINT      NOT NULL REFERENCES minion_jobs(id) ON DELETE CASCADE,
+  acquired_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at    TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rate_leases_key_expires ON subagent_rate_leases (key, expires_at);
+
+-- ============================================================
+-- Cycle coordination lock — v0.17 runCycle primitive
+-- ============================================================
+-- See src/schema.sql for full rationale. One row per active cycle.
+-- PGLite is single-writer, so the lock doubly protects: the DB-level
+-- row + the file lock at ~/.gbrain/cycle.lock prevent concurrent
+-- CLI invocations from racing.
+CREATE TABLE IF NOT EXISTS gbrain_cycle_locks (
+  id              TEXT        PRIMARY KEY,
+  holder_pid      INT         NOT NULL,
+  holder_host     TEXT,
+  acquired_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  ttl_expires_at  TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cycle_locks_ttl ON gbrain_cycle_locks(ttl_expires_at);
 
 -- ============================================================
 -- Trigger-based search_vector (spans pages + timeline_entries)

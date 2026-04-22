@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS pages (
 CREATE INDEX IF NOT EXISTS idx_pages_type ON pages(type);
 CREATE INDEX IF NOT EXISTS idx_pages_frontmatter ON pages USING GIN(frontmatter);
 CREATE INDEX IF NOT EXISTS idx_pages_trgm ON pages USING GIN(title gin_trgm_ops);
+-- v0.13.1 #170: avoids 14.6s seqscan on large brains when listing pages newest-first.
+CREATE INDEX IF NOT EXISTS idx_pages_updated_at_desc ON pages (updated_at DESC);
 
 -- ============================================================
 -- content_chunks: chunked content with embeddings
@@ -280,7 +282,7 @@ CREATE TABLE IF NOT EXISTS minion_jobs (
   backoff_delay    INTEGER     NOT NULL DEFAULT 1000,
   backoff_jitter   REAL        NOT NULL DEFAULT 0.2,
   stalled_counter  INTEGER     NOT NULL DEFAULT 0,
-  max_stalled      INTEGER     NOT NULL DEFAULT 3,
+  max_stalled      INTEGER     NOT NULL DEFAULT 5,
   lock_token       TEXT,
   lock_until       TIMESTAMPTZ,
   delay_until      TIMESTAMPTZ,
@@ -353,6 +355,80 @@ CREATE TABLE IF NOT EXISTS minion_attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_minion_attachments_job ON minion_attachments (job_id);
 ALTER TABLE minion_attachments ALTER COLUMN content SET STORAGE EXTERNAL;
+
+-- ============================================================
+-- Subagent runtime (v0.16.0) — durable LLM loops
+-- ============================================================
+-- Anthropic-native message blocks, one row per Messages API message. Parallel
+-- tool_use blocks in one assistant message live in content_blocks JSONB,
+-- not across rows.
+CREATE TABLE IF NOT EXISTS subagent_messages (
+  id                  BIGSERIAL PRIMARY KEY,
+  job_id              BIGINT      NOT NULL REFERENCES minion_jobs(id) ON DELETE CASCADE,
+  message_idx         INTEGER     NOT NULL,
+  role                TEXT        NOT NULL,
+  content_blocks      JSONB       NOT NULL,
+  tokens_in           INTEGER,
+  tokens_out          INTEGER,
+  tokens_cache_read   INTEGER,
+  tokens_cache_create INTEGER,
+  model               TEXT,
+  ended_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT uniq_subagent_messages_idx UNIQUE (job_id, message_idx),
+  CONSTRAINT chk_subagent_messages_role CHECK (role IN ('user','assistant'))
+);
+CREATE INDEX IF NOT EXISTS idx_subagent_messages_job ON subagent_messages (job_id, message_idx);
+
+-- Two-phase tool execution ledger. Before tool call: INSERT status='pending'.
+-- After success: UPDATE to 'complete' + output. On failure: 'failed' + error.
+-- Replay re-runs 'pending' rows only if the tool is idempotent.
+CREATE TABLE IF NOT EXISTS subagent_tool_executions (
+  id           BIGSERIAL PRIMARY KEY,
+  job_id       BIGINT      NOT NULL REFERENCES minion_jobs(id) ON DELETE CASCADE,
+  message_idx  INTEGER     NOT NULL,
+  tool_use_id  TEXT        NOT NULL,
+  tool_name    TEXT        NOT NULL,
+  input        JSONB       NOT NULL,
+  status       TEXT        NOT NULL,
+  output       JSONB,
+  error        TEXT,
+  started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  ended_at     TIMESTAMPTZ,
+  CONSTRAINT uniq_subagent_tools_use_id UNIQUE (job_id, tool_use_id),
+  CONSTRAINT chk_subagent_tools_status CHECK (status IN ('pending','complete','failed'))
+);
+CREATE INDEX IF NOT EXISTS idx_subagent_tools_job ON subagent_tool_executions (job_id, status);
+
+-- Rate-lease table — concurrency cap on outbound providers (e.g.
+-- anthropic:messages). Acquire: INSERT if active < max_concurrent under
+-- advisory lock. Release: DELETE. Stale leases (expires_at past) auto-prune
+-- on next acquire so crashed workers can't strand capacity.
+CREATE TABLE IF NOT EXISTS subagent_rate_leases (
+  id            BIGSERIAL PRIMARY KEY,
+  key           TEXT        NOT NULL,
+  owner_job_id  BIGINT      NOT NULL REFERENCES minion_jobs(id) ON DELETE CASCADE,
+  acquired_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at    TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rate_leases_key_expires ON subagent_rate_leases (key, expires_at);
+
+-- ============================================================
+-- Cycle coordination lock — v0.17 runCycle primitive
+-- ============================================================
+-- One row per active cycle. Any caller (autopilot daemon, Minions
+-- autopilot-cycle handler, gbrain dream CLI) tries to acquire this
+-- row before running a DB-write phase. Holders refresh ttl_expires_at
+-- between phases; crashed holders auto-release once TTL expires.
+-- Works through PgBouncer transaction pooling, unlike session-scoped
+-- pg_try_advisory_lock.
+CREATE TABLE IF NOT EXISTS gbrain_cycle_locks (
+  id              TEXT        PRIMARY KEY,
+  holder_pid      INT         NOT NULL,
+  holder_host     TEXT,
+  acquired_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  ttl_expires_at  TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cycle_locks_ttl ON gbrain_cycle_locks(ttl_expires_at);
 
 -- NOTIFY trigger for real-time job events (Postgres only, not PGLite)
 CREATE OR REPLACE FUNCTION notify_minion_job_change() RETURNS trigger AS \$\$
