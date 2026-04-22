@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# CI guard: fail if any source file uses the buggy `${JSON.stringify(x)}::jsonb`
-# template-string pattern instead of postgres.js's `sql.json(x)`.
+# CI guard: fail if any source file uses the buggy JSON.stringify(x) interpolation
+# followed by a ::jsonb cast in a template string (postgres.js v3 double-encodes it).
+# Use postgres.js's `sql.json(x)` helper instead.
+#
+# The literal bad token sequence is deliberately NOT written in these comments so
+# this guard does not match itself when scanning scripts/ (see option C note below).
 #
 # This is best-effort static analysis. It catches the common copy-paste form
 # that caused the v0.12.0 silent-data-loss bug (JSONB columns stored as
@@ -17,8 +21,9 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$ROOT"
 
-# Match the interpolated form: ${JSON.stringify(...)}::jsonb
-# Using grep -P for Perl-compatible regex (lookahead-free pattern is enough here).
+# Match: a JSON.stringify call inside a ${...} interpolation, followed by ::jsonb.
+# The regex is built as a literal string below so the token sequence itself does
+# not appear in any comment (prevents self-match; see option C in the runbook).
 PATTERN='\$\{JSON\.stringify\([^)]*\)\}::jsonb'
 
 if grep -rEn "$PATTERN" src/ scripts/ 2>/dev/null; then

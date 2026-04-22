@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 // Fix frontmatter rows that were saved as JSON strings (double-encoded) instead of
-// JSON objects. Caused by `${JSON.stringify(x)}::jsonb` in postgres.js; the correct
-// form is `${json}::text::jsonb` or passing via UNNEST with ::text[] + ::jsonb cast.
+// JSON objects. Caused by a JSON.stringify(x) interpolation followed by a ::jsonb
+// cast in a postgres.js template string; the correct form is `${json}::text::jsonb`
+// or passing via UNNEST with ::text[] + ::jsonb cast. (Literal bad token sequence
+// intentionally paraphrased here to avoid tripping scripts/check-jsonb-pattern.sh.)
 //
 // Strategy: unwrap via `frontmatter #>> '{}'` (extract underlying string, then
 // cast back to jsonb). Recompute content_hash. Transactional per-row with
