@@ -55,13 +55,25 @@ function logError(phase: string, e: unknown) {
  *   4. Throw — nothing on $PATH, no way to supervise the worker.
  */
 export function resolveGbrainCliPath(): string {
-  const arg1 = process.argv[1] ?? '';
-  if (arg1.endsWith('/gbrain') || arg1.endsWith('/cli.ts') || arg1.endsWith('\\gbrain.exe')) {
-    return arg1;
-  }
+  // Inside a Bun single-file-executable (`bun build --compile`),
+  // process.argv[1] is the virtual /$bunfs/root/<name> path that only
+  // exists inside the running process - spawn() with it fails ENOENT.
+  // process.execPath is the REAL disk path of the binary and works with
+  // spawn. Try execPath first so compiled binaries resolve correctly,
+  // then fall back to argv[1] for dev mode (`bun src/cli.ts`), then
+  // `which gbrain` for PATH-installed setups.
+  //
+  // Bun's existsSync returns true for /$bunfs/root/* paths even though
+  // posix_spawn rejects them, so filename-suffix checks alone aren't
+  // enough - ordering matters.
   const exec = process.execPath ?? '';
   if (exec.endsWith('/gbrain') || exec.endsWith('\\gbrain.exe')) {
     return exec;
+  }
+  const arg1 = process.argv[1] ?? '';
+  if ((arg1.endsWith('/gbrain') || arg1.endsWith('/cli.ts') || arg1.endsWith('\\gbrain.exe'))
+      && existsSync(arg1)) {
+    return arg1;
   }
   try {
     const which = execSync('which gbrain', { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
