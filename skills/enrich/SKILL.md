@@ -102,7 +102,7 @@ Extract people, companies, concepts from the incoming signal.
 For each entity:
 - `gbrain search "name"` -- does a page already exist?
 - **If yes:** UPDATE path (add new signal, update compiled truth if material)
-- **If no:** CREATE path (check notability gate first, then create)
+- **If no:** CREATE path (see Step 6 for creation criteria)
 
 ### Step 3: Extract signal from source
 
