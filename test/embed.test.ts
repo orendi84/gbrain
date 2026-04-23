@@ -114,6 +114,8 @@ describe('runEmbed --all (parallel)', () => {
 
     const engine = mockEngine({
       listPages: async () => pages,
+      listSlugsPendingEmbedding: async () => ['stale'],
+      getPage: async (slug: string) => pages.find(p => p.slug === slug) ?? null,
       getChunks: async (slug: string) => chunksBySlug.get(slug) || [],
       upsertChunks: async () => {},
     });
@@ -124,6 +126,164 @@ describe('runEmbed --all (parallel)', () => {
 
     // Only the stale page triggers an embedBatch call.
     expect(totalEmbedCalls).toBe(1);
+  });
+
+  test('fast-path: staleOnly with no stale slugs skips listPages + getChunks entirely', async () => {
+    // Regression guard for the autopilot cycle-timeout fix: on a fully-embedded
+    // brain, embedAll must NOT iterate all pages via listPages+getChunks. It
+    // must early-exit after one listSlugsPendingEmbedding call returning [].
+    let listPagesCalls = 0;
+    let getChunksCalls = 0;
+    const engine = mockEngine({
+      listSlugsPendingEmbedding: async () => [],
+      listPages: async () => { listPagesCalls++; return []; },
+      getChunks: async () => { getChunksCalls++; return []; },
+      upsertChunks: async () => {},
+    });
+
+    await runEmbed(engine, ['--stale']);
+
+    expect(totalEmbedCalls).toBe(0);
+    expect(listPagesCalls).toBe(0);
+    expect(getChunksCalls).toBe(0);
+  });
+
+  test('zero-chunk pages: embedAll staleOnly chunks them on the fly and embeds', async () => {
+    // Pages created via direct putPage() (migrate-engine, enrichment-service,
+    // output/writer) have no content_chunks rows yet. listSlugsPendingEmbedding
+    // surfaces them; embedOnePage must chunk them from page text and embed.
+    // Stateful mock: getChunks returns whatever the last upsertChunks stored
+    // so the re-read after the chunking upsert sees the new rows.
+    const chunkStore = new Map<string, any[]>();
+    const upserts: Array<{ slug: string; chunkCount: number }> = [];
+    const engine = mockEngine({
+      listSlugsPendingEmbedding: async () => ['new-page'],
+      getPage: async (slug: string) =>
+        slug === 'new-page'
+          ? {
+              slug: 'new-page',
+              compiled_truth: 'Hello world. This is some content for embedding.',
+              timeline: '',
+            }
+          : null,
+      getChunks: async (slug: string) => chunkStore.get(slug) ?? [],
+      upsertChunks: async (slug: string, inputs: any[]) => {
+        upserts.push({ slug, chunkCount: inputs.length });
+        // Store as Chunk shape: chunk_index + chunk_text + embedded_at (null
+        // on first upsert so the subsequent stale-filter still catches them).
+        chunkStore.set(slug, inputs.map(i => ({
+          chunk_index: i.chunk_index,
+          chunk_text: i.chunk_text,
+          chunk_source: i.chunk_source,
+          embedded_at: null,
+          token_count: 5,
+        })));
+      },
+    });
+
+    await runEmbed(engine, ['--stale']);
+
+    // First upsert creates the initial chunks.
+    expect(upserts.length).toBeGreaterThanOrEqual(1);
+    expect(upserts[0].slug).toBe('new-page');
+    expect(upserts[0].chunkCount).toBeGreaterThan(0);
+    // Embedding must have run for the new chunks (second upsert writes them back).
+    expect(totalEmbedCalls).toBeGreaterThan(0);
+  });
+
+  test('zero-chunk pages: one bootstrap failure does not abort the batch', async () => {
+    // Regression guard: if getPage or upsertChunks throws for one zero-chunk
+    // page, the worker pool must log and continue with the remaining pages,
+    // not reject Promise.all and drop everything else on the floor.
+    const chunkStore = new Map<string, any[]>();
+    const upserts: string[] = [];
+    let getPageCalls = 0;
+    const engine = mockEngine({
+      listSlugsPendingEmbedding: async () => ['bad-page', 'good-page'],
+      getPage: async (slug: string) => {
+        getPageCalls++;
+        if (slug === 'bad-page') throw new Error('simulated DB blip');
+        return { slug, compiled_truth: 'Good content for embedding.', timeline: '' };
+      },
+      getChunks: async (slug: string) => chunkStore.get(slug) ?? [],
+      upsertChunks: async (slug: string, inputs: any[]) => {
+        upserts.push(slug);
+        chunkStore.set(slug, inputs.map(i => ({
+          chunk_index: i.chunk_index,
+          chunk_text: i.chunk_text,
+          chunk_source: i.chunk_source,
+          embedded_at: null,
+          token_count: 5,
+        })));
+      },
+    });
+
+    // Should NOT throw - the bad page's error is caught per-page.
+    await runEmbed(engine, ['--stale']);
+
+    expect(getPageCalls).toBe(2);
+    // Good page completed all the way through embed + final upsert.
+    // 'bad-page' never upserted (failed at getPage). 'good-page' upserted
+    // twice (initial chunk write, then embedding write-back).
+    expect(upserts.filter(s => s === 'good-page').length).toBeGreaterThanOrEqual(1);
+    expect(upserts.filter(s => s === 'bad-page').length).toBe(0);
+    expect(totalEmbedCalls).toBeGreaterThan(0);
+  });
+
+  test('zero-chunk pages in dry-run: counts would_embed without any write or API call', async () => {
+    const upserts: string[] = [];
+    const engine = mockEngine({
+      listSlugsPendingEmbedding: async () => ['new-page'],
+      getPage: async () => ({
+        slug: 'new-page',
+        compiled_truth: 'short text',
+        timeline: '',
+      }),
+      getChunks: async () => [],
+      upsertChunks: async (slug: string) => { upserts.push(slug); },
+    });
+
+    const { runEmbedCore } = await import('../src/commands/embed.ts');
+    const result = await runEmbedCore(engine, { stale: true, dryRun: true });
+
+    expect(upserts).toEqual([]);
+    expect(totalEmbedCalls).toBe(0);
+    expect(result.dryRun).toBe(true);
+    expect(result.would_embed).toBeGreaterThan(0);
+  });
+
+  test('fast-path: staleOnly with N stale slugs skips listPages AND getPage (no hydration fan-out)', async () => {
+    // Regression guard for the codex-caught bug: the stale-path must iterate
+    // slugs directly, NOT hydrate them via Promise.all(staleSlugs.map(getPage)).
+    // That fan-out would fire ahead of the GBRAIN_EMBED_CONCURRENCY throttle
+    // on a large-stale-brain and reintroduce the pool exhaustion this fix
+    // is meant to address.
+    const staleSlugs = Array.from({ length: 500 }, (_, i) => `page-${i}`);
+    const chunksBySlug = new Map(
+      staleSlugs.map(s => [
+        s,
+        [{ chunk_index: 0, chunk_text: `t ${s}`, chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 }],
+      ]),
+    );
+
+    let listPagesCalls = 0;
+    let getPageCalls = 0;
+    const engine = mockEngine({
+      listSlugsPendingEmbedding: async () => staleSlugs,
+      listPages: async () => { listPagesCalls++; return []; },
+      getPage: async () => { getPageCalls++; return null; },
+      getChunks: async (slug: string) => chunksBySlug.get(slug) || [],
+      upsertChunks: async () => {},
+    });
+
+    process.env.GBRAIN_EMBED_CONCURRENCY = '10';
+    await runEmbed(engine, ['--stale']);
+
+    // embedBatch runs for each stale slug (through the worker pool).
+    expect(totalEmbedCalls).toBe(500);
+    // But no pre-embed fan-out:
+    expect(listPagesCalls).toBe(0);
+    expect(getPageCalls).toBe(0);
   });
 });
 
@@ -149,6 +309,8 @@ describe('runEmbedCore --dry-run never calls the embedding model', () => {
     const upserts: string[] = [];
     const engine = mockEngine({
       listPages: async () => pages,
+      listSlugsPendingEmbedding: async () => pages.map(p => p.slug),
+      getPage: async (slug: string) => pages.find(p => p.slug === slug) ?? null,
       getChunks: async (slug: string) => chunksBySlug.get(slug) || [],
       upsertChunks: async (slug: string) => { upserts.push(slug); },
     });
@@ -188,6 +350,8 @@ describe('runEmbedCore --dry-run never calls the embedding model', () => {
 
     const engine = mockEngine({
       listPages: async () => pages,
+      listSlugsPendingEmbedding: async () => ['partial', 'all-stale'],
+      getPage: async (slug: string) => pages.find(p => p.slug === slug) ?? null,
       getChunks: async (slug: string) => chunksBySlug.get(slug) || [],
       upsertChunks: async () => {},
     });
@@ -196,10 +360,12 @@ describe('runEmbedCore --dry-run never calls the embedding model', () => {
 
     expect(totalEmbedCalls).toBe(0);
     expect(result.dryRun).toBe(true);
+    // Fast path only iterates stale pages, so counts reflect those:
+    // 'partial' (2 chunks: 1 stale + 1 skipped) + 'all-stale' (2 stale)
     expect(result.would_embed).toBe(3); // 1 from 'partial' + 2 from 'all-stale'
-    expect(result.skipped).toBe(3); // 2 from 'fresh' + 1 from 'partial'
-    expect(result.total_chunks).toBe(6);
-    expect(result.pages_processed).toBe(3);
+    expect(result.skipped).toBe(1); // the fresh chunk on 'partial'
+    expect(result.total_chunks).toBe(4);
+    expect(result.pages_processed).toBe(2);
   });
 
   test('dry-run --slugs on a single page counts stale chunks, no API calls', async () => {
@@ -239,6 +405,8 @@ describe('runEmbedCore --dry-run never calls the embedding model', () => {
 
     const engine = mockEngine({
       listPages: async () => pages,
+      listSlugsPendingEmbedding: async () => pages.map(p => p.slug),
+      getPage: async (slug: string) => pages.find(p => p.slug === slug) ?? null,
       getChunks: async (slug: string) => chunksBySlug.get(slug) || [],
       upsertChunks: async () => {},
     });

@@ -412,6 +412,40 @@ export class PostgresEngine implements BrainEngine {
     `;
   }
 
+  async listSlugsPendingEmbedding(): Promise<string[]> {
+    const sql = this.sql;
+    // Two cases: (1) page has chunks with embedded_at IS NULL, (2) page has no
+    // chunk rows but DOES have text to chunk (compiled_truth or timeline). The
+    // text guard on branch 2 excludes empty/placeholder pages so they don't
+    // get rediscovered every cycle, which would make pending_pages overstate
+    // real work. UNION merges + dedupes.
+    //
+    // Known limitation (v0.18+ multi-source): returns slugs without source_id,
+    // so two pages sharing a slug across sources collapse to one entry here.
+    // This matches the pre-existing slug-only semantics of getChunks,
+    // upsertChunks, and getPage - fixing it properly requires threading
+    // source_id through all four methods + every call site (separate
+    // multi-source-hardening PR, not a regression introduced by this change).
+    const rows = await sql<{ slug: string }[]>`
+      SELECT DISTINCT p.slug
+        FROM content_chunks cc
+        JOIN pages p ON p.id = cc.page_id
+       WHERE cc.embedded_at IS NULL
+      UNION
+      SELECT p.slug
+        FROM pages p
+       WHERE NOT EXISTS (
+         SELECT 1 FROM content_chunks WHERE page_id = p.id
+       )
+         AND (
+           LENGTH(regexp_replace(COALESCE(p.compiled_truth, ''), '[[:space:]]', '', 'g')) > 0
+           OR LENGTH(regexp_replace(COALESCE(p.timeline, ''), '[[:space:]]', '', 'g')) > 0
+         )
+       ORDER BY 1
+    `;
+    return rows.map((r) => r.slug);
+  }
+
   // Links
   async addLink(
     from: string,

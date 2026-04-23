@@ -102,6 +102,14 @@ export interface BrainEngine {
   upsertChunks(slug: string, chunks: ChunkInput[]): Promise<void>;
   getChunks(slug: string): Promise<Chunk[]>;
   deleteChunks(slug: string): Promise<void>;
+  /**
+   * Returns slugs of pages that need embedding work - either they have at least
+   * one chunk with embedded_at IS NULL, OR they have no chunk rows at all (pages
+   * created via direct putPage() that haven't been chunked yet, e.g. migrate-engine
+   * or enrichment-service writes). Used by embed --stale to avoid 15K per-page
+   * probe queries on fully-embedded brains. Returns [] when nothing is pending.
+   */
+  listSlugsPendingEmbedding(): Promise<string[]>;
 
   // Links
   /**

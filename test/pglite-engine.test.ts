@@ -242,6 +242,108 @@ describe('PGLiteEngine: Chunks', () => {
     expect(chunks.length).toBe(1);
     expect(chunks[0].embedding).not.toBeNull();
   });
+
+  test('listSlugsPendingEmbedding returns [] when all chunks are embedded', async () => {
+    await engine.putPage('test/all-fresh', testPage);
+    const embedding = new Float32Array(1536).fill(0.1);
+    await engine.upsertChunks('test/all-fresh', [
+      { chunk_index: 0, chunk_text: 'a', chunk_source: 'compiled_truth', embedding },
+      { chunk_index: 1, chunk_text: 'b', chunk_source: 'compiled_truth', embedding },
+    ]);
+    const slugs = await engine.listSlugsPendingEmbedding();
+    expect(slugs).toEqual([]);
+  });
+
+  test('listSlugsPendingEmbedding returns only slugs with at least one NULL embedded_at', async () => {
+    const embedding = new Float32Array(1536).fill(0.1);
+    // Page A: all embedded
+    await engine.putPage('test/alpha', testPage);
+    await engine.upsertChunks('test/alpha', [
+      { chunk_index: 0, chunk_text: 'a', chunk_source: 'compiled_truth', embedding },
+    ]);
+    // Page B: no embeddings (all stale)
+    await engine.putPage('test/beta', testPage);
+    await engine.upsertChunks('test/beta', [
+      { chunk_index: 0, chunk_text: 'b', chunk_source: 'compiled_truth' },
+    ]);
+    // Page C: mixed (one embedded, one not)
+    await engine.putPage('test/gamma', testPage);
+    await engine.upsertChunks('test/gamma', [
+      { chunk_index: 0, chunk_text: 'c0', chunk_source: 'compiled_truth', embedding },
+      { chunk_index: 1, chunk_text: 'c1', chunk_source: 'compiled_truth' },
+    ]);
+
+    const slugs = await engine.listSlugsPendingEmbedding();
+    expect(slugs).toEqual(['test/beta', 'test/gamma']);
+  });
+
+  test('listSlugsPendingEmbedding returns each slug at most once (DISTINCT)', async () => {
+    await engine.putPage('test/multi-stale', testPage);
+    await engine.upsertChunks('test/multi-stale', [
+      { chunk_index: 0, chunk_text: 'x', chunk_source: 'compiled_truth' },
+      { chunk_index: 1, chunk_text: 'y', chunk_source: 'compiled_truth' },
+      { chunk_index: 2, chunk_text: 'z', chunk_source: 'compiled_truth' },
+    ]);
+    const slugs = await engine.listSlugsPendingEmbedding();
+    expect(slugs).toEqual(['test/multi-stale']);
+  });
+
+  test('listSlugsPendingEmbedding includes zero-chunk pages (created via putPage without chunks)', async () => {
+    // Simulates pages written by migrate-engine / enrichment-service / output/writer
+    // that call putPage() directly and rely on a later embed pass to chunk them.
+    await engine.putPage('test/no-chunks-yet', testPage);
+    // No upsertChunks call — intentionally.
+
+    const slugs = await engine.listSlugsPendingEmbedding();
+    expect(slugs).toContain('test/no-chunks-yet');
+  });
+
+  test('listSlugsPendingEmbedding UNIONs zero-chunk and stale-chunk pages in one set', async () => {
+    const embedding = new Float32Array(1536).fill(0.1);
+    // Page with no chunks
+    await engine.putPage('test/zero', testPage);
+    // Page with stale chunk
+    await engine.putPage('test/stale', testPage);
+    await engine.upsertChunks('test/stale', [
+      { chunk_index: 0, chunk_text: 's', chunk_source: 'compiled_truth' },
+    ]);
+    // Page fully embedded (should NOT appear)
+    await engine.putPage('test/done', testPage);
+    await engine.upsertChunks('test/done', [
+      { chunk_index: 0, chunk_text: 'd', chunk_source: 'compiled_truth', embedding },
+    ]);
+
+    const slugs = await engine.listSlugsPendingEmbedding();
+    expect(slugs.sort()).toEqual(['test/stale', 'test/zero']);
+  });
+
+  test('listSlugsPendingEmbedding excludes empty-text zero-chunk pages (no rediscovery loop)', async () => {
+    // Regression guard: pages with zero chunks AND empty text (no compiled_truth,
+    // no timeline) must NOT be pending - embedOnePage would early-return without
+    // writing, so the primitive would re-surface the same slug every cycle.
+    await engine.putPage('test/empty-placeholder', {
+      ...testPage,
+      compiled_truth: '',
+      timeline: '',
+    });
+    // Also one with whitespace-only text — must also be excluded.
+    await engine.putPage('test/whitespace-only', {
+      ...testPage,
+      compiled_truth: '   \n\t  ',
+      timeline: '',
+    });
+    // A page with real text should still appear.
+    await engine.putPage('test/has-text', {
+      ...testPage,
+      compiled_truth: 'Real content to chunk.',
+      timeline: '',
+    });
+
+    const slugs = await engine.listSlugsPendingEmbedding();
+    expect(slugs).not.toContain('test/empty-placeholder');
+    expect(slugs).not.toContain('test/whitespace-only');
+    expect(slugs).toContain('test/has-text');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────

@@ -135,6 +135,28 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
   }
 }
 
+/**
+ * Build initial chunk inputs from a Page's compiled_truth + timeline text.
+ * Pure function - no DB I/O, no embedding calls. Caller decides whether to
+ * upsert or count for dry-run. Shared between embedPage (single-slug CLI path)
+ * and embedOnePage (bulk worker-pool path) so zero-chunk pages get handled
+ * identically in both.
+ */
+function buildInitialChunkInputs(page: { compiled_truth: string; timeline: string }): ChunkInput[] {
+  const inputs: ChunkInput[] = [];
+  if (page.compiled_truth.trim()) {
+    for (const c of chunkText(page.compiled_truth)) {
+      inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'compiled_truth' });
+    }
+  }
+  if (page.timeline.trim()) {
+    for (const c of chunkText(page.timeline)) {
+      inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'timeline' });
+    }
+  }
+  return inputs;
+}
+
 async function embedPage(
   engine: BrainEngine,
   slug: string,
@@ -151,17 +173,7 @@ async function embedPage(
   // embedded — but we never write chunks or call the embedding model.
   let chunks = await engine.getChunks(slug);
   if (chunks.length === 0) {
-    const inputs: ChunkInput[] = [];
-    if (page.compiled_truth.trim()) {
-      for (const c of chunkText(page.compiled_truth)) {
-        inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'compiled_truth' });
-      }
-    }
-    if (page.timeline.trim()) {
-      for (const c of chunkText(page.timeline)) {
-        inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'timeline' });
-      }
-    }
+    const inputs = buildInitialChunkInputs(page);
 
     if (dryRun) {
       // Count what chunking WOULD produce, without writing.
@@ -220,7 +232,35 @@ async function embedAll(
   result: EmbedResult,
   onProgress?: (done: number, total: number, embedded: number) => void,
 ) {
-  const pages = await engine.listPages({ limit: 100000 });
+  // Fast path when staleOnly=true: ask the DB which slugs actually need work
+  // BEFORE fetching page rows + doing per-page getChunks probes. On a
+  // fully-embedded brain this returns [] and the phase completes in ms
+  // instead of burning ~15K Supabase round-trips to discover nothing to do.
+  //
+  // The primitive includes pages with stale chunks AND pages with no chunk
+  // rows (created via direct putPage), so embedOnePage will handle both.
+  //
+  // embedOnePage only reads page.slug, so we intentionally do NOT hydrate
+  // full page rows here. Hydrating N slugs via N parallel getPage calls
+  // would fan out ahead of the GBRAIN_EMBED_CONCURRENCY throttle and
+  // regress the large-stale-brain case this fix is meant to help. Pages
+  // that turn out to need chunking (zero-chunk case) have their getPage
+  // deferred to embedOnePage, which runs inside the throttled worker pool.
+  let pages: Array<{ slug: string }>;
+  if (staleOnly) {
+    const pendingSlugs = await engine.listSlugsPendingEmbedding();
+    if (pendingSlugs.length === 0) {
+      if (dryRun) {
+        console.log(`[dry-run] Would embed 0 chunks across 0 pages (nothing pending)`);
+      } else {
+        console.log(`Embedded 0 chunks across 0 pages (nothing pending)`);
+      }
+      return;
+    }
+    pages = pendingSlugs.map(slug => ({ slug }));
+  } else {
+    pages = await engine.listPages({ limit: 100000 });
+  }
   let processed = 0;
 
   // Concurrency limit for parallel page embedding.
@@ -234,7 +274,60 @@ async function embedAll(
   const CONCURRENCY = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '20', 10);
 
   async function embedOnePage(page: typeof pages[number]) {
-    const chunks = await engine.getChunks(page.slug);
+    let chunks = await engine.getChunks(page.slug);
+
+    // Zero-chunk page path: pages created via direct putPage() (migrate-engine,
+    // enrichment-service, output/writer) have no content_chunks rows yet. Build
+    // initial chunks from compiled_truth + timeline so embed --stale and
+    // autopilot actually embed them instead of leaving them stranded. This runs
+    // inside the worker pool, so it stays throttled by GBRAIN_EMBED_CONCURRENCY.
+    //
+    // Wrapped in try/catch so one failed bootstrap (getPage / upsertChunks
+    // transient error) logs and moves on instead of aborting the whole
+    // worker pool via Promise.all rejection. Matches the error-handling
+    // semantics of the main embed path below.
+    if (chunks.length === 0) {
+      try {
+        const full = await engine.getPage(page.slug);
+        if (!full) {
+          // Page was deleted between listing and processing; skip silently.
+          processed++;
+          result.pages_processed++;
+          onProgress?.(processed, pages.length, result.embedded);
+          return;
+        }
+        const inputs = buildInitialChunkInputs(full);
+
+        if (dryRun) {
+          result.total_chunks += inputs.length;
+          result.would_embed += inputs.length;
+          processed++;
+          result.pages_processed++;
+          onProgress?.(processed, pages.length, result.embedded);
+          return;
+        }
+
+        if (inputs.length > 0) {
+          await engine.upsertChunks(page.slug, inputs);
+          chunks = await engine.getChunks(page.slug);
+        } else {
+          // Page has no text to chunk (empty compiled_truth + timeline). The
+          // pending-primitive normally filters these out, but we defend in
+          // depth in case of a race or a caller bypassing the primitive.
+          processed++;
+          result.pages_processed++;
+          onProgress?.(processed, pages.length, result.embedded);
+          return;
+        }
+      } catch (e: unknown) {
+        console.error(`\n  Error bootstrapping chunks for ${page.slug}: ${e instanceof Error ? e.message : e}`);
+        processed++;
+        result.pages_processed++;
+        onProgress?.(processed, pages.length, result.embedded);
+        return;
+      }
+    }
+
     const toEmbed = staleOnly
       ? chunks.filter(c => !c.embedded_at)
       : chunks;

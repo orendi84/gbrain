@@ -400,6 +400,36 @@ export class PGLiteEngine implements BrainEngine {
     );
   }
 
+  async listSlugsPendingEmbedding(): Promise<string[]> {
+    // UNION: pages with stale chunks OR zero-chunk pages with real text.
+    // Empty-text zero-chunk pages are excluded so they don't get rediscovered
+    // every cycle (embedOnePage would early-return without writing, leaving
+    // the page permanently "pending").
+    //
+    // Known limitation (v0.18+ multi-source): returns slugs without source_id,
+    // so two pages sharing a slug across sources collapse to one entry here.
+    // Matches the pre-existing slug-only semantics of getChunks, upsertChunks,
+    // and getPage - separate multi-source-hardening PR, not a regression here.
+    const { rows } = await this.db.query(
+      `SELECT DISTINCT p.slug
+         FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+        WHERE cc.embedded_at IS NULL
+       UNION
+       SELECT p.slug
+         FROM pages p
+        WHERE NOT EXISTS (
+          SELECT 1 FROM content_chunks WHERE page_id = p.id
+        )
+          AND (
+            LENGTH(regexp_replace(COALESCE(p.compiled_truth, ''), '[[:space:]]', '', 'g')) > 0
+            OR LENGTH(regexp_replace(COALESCE(p.timeline, ''), '[[:space:]]', '', 'g')) > 0
+          )
+        ORDER BY 1`
+    );
+    return (rows as { slug: string }[]).map(r => r.slug);
+  }
+
   // Links
   async addLink(
     from: string,

@@ -224,7 +224,37 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
         const queue = new MinionQueue(engine);
         const slotMs = Math.floor(Date.now() / (baseInterval * 1000)) * baseInterval * 1000;
         const slot = new Date(slotMs).toISOString();
-        const timeoutMs = Math.max(baseInterval * 2 * 1000, 300_000);
+        // Per-job wall-clock timeout for the autopilot-cycle Minion job.
+        //
+        // Default: baseInterval * 4. Keeps the timeout proportional to the
+        // slot cadence so short-interval operators (say 60s) don't accumulate
+        // stale cycle jobs while a hung one waits out a 15-minute watchdog -
+        // with the slot-scoped idempotency key, a long timeout lets multiple
+        // slots queue up waiting. On the default 300s interval that's 20 min.
+        //
+        // GBRAIN_AUTOPILOT_JOB_TIMEOUT_MS overrides for operators who need
+        // more (huge brain, slow pooler) or less (tight SLA, aggressive fail
+        // fast). Strict digit-only parse - '15m' or '300000 # override' must
+        // NOT be accepted via parseInt's numeric-prefix behavior, or we'd
+        // schedule every cycle to time out immediately. Capped at INT4 max
+        // so it fits minion_jobs.timeout_ms without overflow. Invalid values
+        // fall through to the computed default with a warning.
+        const JOB_TIMEOUT_MAX_MS = 2_147_483_647; // postgres INTEGER max
+        const envOverrideRaw = process.env.GBRAIN_AUTOPILOT_JOB_TIMEOUT_MS;
+        let envOverride: number | null = null;
+        if (envOverrideRaw !== undefined && envOverrideRaw !== '') {
+          const trimmed = envOverrideRaw.trim();
+          if (/^\d+$/.test(trimmed)) {
+            const parsed = parseInt(trimmed, 10);
+            if (parsed > 0 && parsed <= JOB_TIMEOUT_MAX_MS) envOverride = parsed;
+          }
+          if (envOverride === null) {
+            console.warn(
+              `[autopilot] Ignoring invalid GBRAIN_AUTOPILOT_JOB_TIMEOUT_MS=${JSON.stringify(envOverrideRaw)} (must be a positive integer <= ${JOB_TIMEOUT_MAX_MS} ms). Falling back to default.`,
+            );
+          }
+        }
+        const timeoutMs = envOverride ?? baseInterval * 4 * 1000;
         const job = await queue.add('autopilot-cycle',
           { repoPath },
           {

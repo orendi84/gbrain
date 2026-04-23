@@ -560,6 +560,53 @@ describeE2E('E2E: Chunks & Resolution', () => {
     const matches = await callOp('resolve_slugs', { partial: 'people/sarah-chen' }) as string[];
     expect(matches).toContain('people/sarah-chen');
   });
+
+  // ─────────────────────────────────────────────────────────────
+  // listSlugsPendingEmbedding: Postgres engine regression coverage
+  // for the autopilot cycle-timeout fix. PGLite version lives in
+  // test/pglite-engine.test.ts; this mirrors it against real pgvector.
+  // ─────────────────────────────────────────────────────────────
+
+  test('listSlugsPendingEmbedding: identifies slugs with NULL embedded_at chunks', async () => {
+    const engine = getEngine();
+    // Fixture import leaves chunks without embeddings (importFixtures uses
+    // --no-embed), so every imported page should have stale chunks.
+    const stale = await engine.listSlugsPendingEmbedding();
+    expect(stale.length).toBeGreaterThan(0);
+    expect(stale).toContain('people/sarah-chen');
+  });
+
+  test('listSlugsPendingEmbedding: DISTINCT per slug even with many stale chunks', async () => {
+    const engine = getEngine();
+    const stale = await engine.listSlugsPendingEmbedding();
+    const set = new Set(stale);
+    expect(set.size).toBe(stale.length);
+  });
+
+  test('listSlugsPendingEmbedding: excludes pages where all chunks have embedded_at', async () => {
+    const engine = getEngine();
+    const conn = getConn();
+
+    // Force one page's chunks to appear embedded by stamping embedded_at.
+    // Scoped so we can revert after.
+    await conn.unsafe(`
+      UPDATE content_chunks
+         SET embedded_at = now()
+       WHERE page_id = (SELECT id FROM pages WHERE slug = 'people/sarah-chen')
+    `);
+
+    try {
+      const stale = await engine.listSlugsPendingEmbedding();
+      expect(stale).not.toContain('people/sarah-chen');
+    } finally {
+      // Restore NULL embedded_at so later tests in the same block aren't affected.
+      await conn.unsafe(`
+        UPDATE content_chunks
+           SET embedded_at = NULL
+         WHERE page_id = (SELECT id FROM pages WHERE slug = 'people/sarah-chen')
+      `);
+    }
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────
