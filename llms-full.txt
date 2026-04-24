@@ -222,7 +222,7 @@ strict behavior when unset.
 - `skills/soul-audit/SKILL.md` — 6-phase interview for SOUL.md, USER.md, ACCESS_POLICY.md, HEARTBEAT.md
 - `skills/webhook-transforms/SKILL.md` — External events to brain signals
 - `skills/data-research/SKILL.md` — Structured data research: email-to-tracker pipeline with parameterized YAML recipes
-- `skills/minion-orchestrator/SKILL.md` — Background job orchestration: submit, fan out children with depth/cap/timeouts, collect results via child_done inbox
+- `skills/minion-orchestrator/SKILL.md` — Unified background-work skill (v0.20.4 consolidation of the former `minion-orchestrator` + `gbrain-jobs` split). Two lanes: shell jobs via `gbrain jobs submit shell --params '{"cmd":"..."}'` (operator/CLI only; MCP throws `permission_denied` for protected names) and LLM subagents via `gbrain agent run` (user-facing entrypoint). Shared Preconditions block, parent-child DAGs with depth/cap/timeouts, `child_done` inbox for fan-in, PGLite `--follow` inline path for dev. Triggers narrowed from bare `"gbrain jobs"` to `"gbrain jobs submit"` + `"submit a gbrain job"` so `stats`/`prune`/`retry` questions fall through to `gbrain --help`.
 - `templates/` — SOUL.md, USER.md, ACCESS_POLICY.md, HEARTBEAT.md templates
 - `skills/migrations/` — Version migration files with feature_pitch YAML frontmatter
 - `src/commands/publish.ts` — Deterministic brain page publisher (code+skill pair, zero LLM calls)
@@ -307,7 +307,7 @@ parity), `test/cli.test.ts` (CLI structure), `test/config.test.ts` (config redac
 `test/lint.test.ts` (LLM artifact detection, code fence stripping, frontmatter validation),
 `test/report.test.ts` (report format, directory structure),
 `test/skills-conformance.test.ts` (skill frontmatter + required sections validation),
-`test/resolver.test.ts` (RESOLVER.md coverage, routing validation),
+`test/resolver.test.ts` (RESOLVER.md coverage, routing validation + v0.20.4 round-trip: every quoted RESOLVER.md trigger must match a frontmatter `triggers:` entry in the target skill, and every `name="<word>"` reference in any SKILL.md must resolve to a declared op in `src/core/operations.ts` or a Minions handler in `PROTECTED_JOB_NAMES`),
 `test/search.test.ts` (RRF normalization, compiled truth boost, cosine similarity, dedup key),
 `test/dedup.test.ts` (source-aware dedup, compiled truth guarantee, layer interactions),
 `test/intent.test.ts` (query intent classification: entity/temporal/event/general),
@@ -355,6 +355,7 @@ E2E tests (`test/e2e/`): Run against real Postgres+pgvector. Require `DATABASE_U
 - `test/e2e/postgres-jsonb.test.ts` — v0.12.2 regression test. Round-trips all 5 JSONB write sites (pages.frontmatter, raw_data.data, ingest_log.pages_updated, files.metadata, page_versions.frontmatter) against real Postgres and asserts `jsonb_typeof='object'` plus `->>'key'` returns the expected scalar. The test that should have caught the original double-encode bug.
 - `test/e2e/jsonb-roundtrip.test.ts` — v0.12.3 companion regression against the 4 doctor-scanned JSONB sites. Assertion-level overlap with `postgres-jsonb.test.ts` is intentional defense-in-depth: if doctor's scan surface ever drifts from the actual write surface, one of these tests catches it.
 - `test/e2e/upgrade.test.ts` runs check-update E2E against real GitHub API (network required)
+- `test/e2e/minions-shell-pglite.test.ts` (v0.20.4) exercises the PGLite `--follow` inline shell-job path (in-memory, no `DATABASE_URL` required) — the path the consolidated minion-orchestrator skill documents for dev use
 - `test/e2e/openclaw-reference-compat.test.ts` (v0.19) — exercises `check-resolvable` + `skillpack install` against a minimal AGENTS.md workspace fixture (`test/fixtures/openclaw-reference-minimal/`), regression guard for the 107-skill OpenClaw deployment shape
 - Tier 2 (`skills.test.ts`) requires OpenClaw + API keys, runs nightly in CI
 - If `.env.testing` doesn't exist in this directory, check sibling worktrees for one:
@@ -407,7 +408,7 @@ stop and remove it before starting a new one.
 
 ## Skills
 
-Read the skill files in `skills/` before doing brain operations. GBrain ships 28 skills
+Read the skill files in `skills/` before doing brain operations. GBrain ships 29 skills
 organized by `skills/RESOLVER.md` (`AGENTS.md` is also accepted as of v0.19):
 
 **Original 8 (conformance-migrated):** ingest (thin router), query, maintain, enrich,
@@ -417,10 +418,18 @@ briefing, migrate, setup, publish.
 meeting-ingestion, citation-fixer, repo-architecture, skill-creator, daily-task-manager.
 
 **Operational + identity:** daily-task-prep, cross-modal-review, cron-scheduler, reports,
-testing, soul-audit, webhook-transforms, data-research, minion-orchestrator.
+testing, soul-audit, webhook-transforms, data-research, minion-orchestrator. As of
+v0.20.4, `minion-orchestrator` is the single unified skill for both lanes of background
+work (shell jobs via `gbrain jobs submit shell`, LLM subagents via `gbrain agent run`) ...
+the prior `gbrain-jobs` skill was merged in, Preconditions are shared, and trigger
+routing is narrowed to what the skill actually covers.
 
 **Skillify loop (v0.19):** skillify (the markdown orchestration), skillpack-check
 (agent-readable health report).
+
+**Operational health (v0.19.1):** smoke-test (8 post-restart health checks with auto-fix
+for Bun, CLI, DB, worker, Zod CJS, gateway, API key, brain repo; user-extensible via
+`~/.gbrain/smoke-tests.d/*.sh`).
 
 **Conventions:** `skills/conventions/` has cross-cutting rules (quality, brain-first,
 model-routing, test-before-bulk, cross-modal). `skills/_brain-filing-rules.md` and
@@ -1142,7 +1151,7 @@ This is the dispatcher. Skills are the implementation. **Read the skill file bef
 | Cross-modal review, second opinion | `skills/cross-modal-review/SKILL.md` |
 | "Validate skills", skill health check | `skills/testing/SKILL.md` |
 | Webhook setup, external event processing | `skills/webhook-transforms/SKILL.md` |
-| "Spawn agent", "background task", "parallel tasks", "steer agent", "pause/resume agent" | `skills/minion-orchestrator/SKILL.md` |
+| "Spawn agent", "background task", "parallel tasks", "steer agent", "pause/resume agent", "gbrain jobs submit", "submit a gbrain job", "submit a shell job", "shell job" | `skills/minion-orchestrator/SKILL.md` |
 
 ## Setup & migration
 
@@ -1199,7 +1208,7 @@ Built by the President and CEO of Y Combinator to run his actual AI agents. The 
 
 The brain wires itself. Every page write extracts entity references and creates typed links (`attended`, `works_at`, `invested_in`, `founded`, `advises`) with zero LLM calls. Hybrid search. Self-wiring knowledge graph. Structured timeline. Backlink-boosted ranking. Ask "who works at Acme AI?" or "what did Bob invest in this quarter?" and get answers vector search alone can't reach. Benchmarked side-by-side against the category: gbrain lands **P@5 49.1%, R@5 97.9%** on a 240-page Opus-generated rich-prose corpus, beating its own graph-disabled variant by **+31.4 points P@5** and ripgrep-BM25 + vector-only RAG by a similar margin. The graph layer plus v0.12 extract quality together carry the gap. Full BrainBench scorecards + corpus live in the sibling [gbrain-evals](https://github.com/garrytan/gbrain-evals) repo.
 
-GBrain is those patterns, generalized. 28 skills. Install in 30 minutes. Your agent does the work. As Garry's personal agent gets smarter, so does yours.
+GBrain is those patterns, generalized. 29 skills. Install in 30 minutes. Your agent does the work. As Garry's personal agent gets smarter, so does yours.
 
 > **~30 minutes to a fully working brain.** Database ready in 2 seconds (PGLite, no server). You just answer questions about API keys.
 
@@ -1221,7 +1230,7 @@ Retrieve and follow the instructions at:
 https://raw.githubusercontent.com/garrytan/gbrain/master/INSTALL_FOR_AGENTS.md
 ```
 
-That's it. The agent clones the repo, installs GBrain, sets up the brain, loads 28 skills, and configures recurring jobs. You answer a few questions about API keys. ~30 minutes.
+That's it. The agent clones the repo, installs GBrain, sets up the brain, loads 29 skills, and configures recurring jobs. You answer a few questions about API keys. ~30 minutes.
 
 If your agent doesn't auto-read `AGENTS.md`, point it at that file first:
 `https://raw.githubusercontent.com/garrytan/gbrain/master/AGENTS.md` is the non-Claude
@@ -1280,9 +1289,9 @@ claude mcp add gbrain -t http https://your-brain.ngrok.app/mcp -H "Authorization
 
 Per-client guides: [`docs/mcp/`](docs/mcp/DEPLOY.md). ChatGPT requires OAuth 2.1 (not yet implemented).
 
-## The 28 Skills
+## The 29 Skills
 
-GBrain ships 28 skills organized by `skills/RESOLVER.md` (or your OpenClaw's `AGENTS.md` — both filenames are supported as of v0.19). The resolver tells your agent which skill to read for any task.
+GBrain ships 29 skills organized by `skills/RESOLVER.md` (or your OpenClaw's `AGENTS.md` — both filenames are supported as of v0.19). The resolver tells your agent which skill to read for any task.
 
 [Skill files are code.](https://x.com/garrytan/status/2042925773300908103) They're the most powerful way to get knowledge work done. A skill file is a fat markdown document that encodes an entire workflow: when to fire, what to check, how to chain with other skills, what quality bar to enforce. The agent reads the skill and executes it. Skills can also call deterministic TypeScript code bundled in GBrain (search, import, embed, sync) for the parts that shouldn't be left to LLM judgment. [Thin harness, fat skills](docs/ethos/THIN_HARNESS_FAT_SKILLS.md): the intelligence lives in the skills, not the runtime.
 
@@ -1328,7 +1337,8 @@ GBrain ships 28 skills organized by `skills/RESOLVER.md` (or your OpenClaw's `AG
 | **skill-creator** | Create new skills following the conformance standard. MECE check against existing skills. |
 | **skillify** | The "skillify it!" meta-skill. Orchestrates the 10-step loop so failures become durable skills: scaffold the stubs via `gbrain skillify scaffold`, write the real logic, gate with `gbrain skillify check` + `gbrain check-resolvable`. |
 | **skillpack-check** | Agent-readable gbrain health report. Exit code for CI; JSON for debugging. Cron-friendly. |
-| **minion-orchestrator** | Long-running agent work as background jobs. Submit, fan out children with depth/cap/timeouts, collect results via child_done inbox. |
+| **smoke-test** | 8 post-restart health checks with auto-fix (Bun, CLI, DB, worker, Zod CJS, gateway, API key, brain repo). Drop-in user tests at `~/.gbrain/smoke-tests.d/*.sh`. |
+| **minion-orchestrator** | Background work in one skill. Shell jobs via `gbrain jobs submit shell` (operator/CLI, MCP blocks protected names) and LLM subagents via `gbrain agent run`. Parent-child DAGs, `child_done` inbox, durability across worker restarts. |
 
 ### Identity and setup
 
@@ -1570,7 +1580,7 @@ Run `gbrain integrations` to see status.
 │   Brain Repo     │    │    GBrain     │    │    AI Agent      │
 │   (git)          │    │  (retrieval)  │    │  (read/write)    │
 │                  │    │               │    │                  │
-│  markdown files  │───>│  Postgres +   │<──>│  28 skills       │
+│  markdown files  │───>│  Postgres +   │<──>│  29 skills       │
 │  = source of     │    │  pgvector     │    │  define HOW to   │
 │    truth         │    │               │    │  use the brain   │
 │                  │<───│  hybrid       │    │                  │

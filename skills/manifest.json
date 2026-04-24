@@ -132,7 +132,7 @@
     {
       "name": "minion-orchestrator",
       "path": "minion-orchestrator/SKILL.md",
-      "description": "Manage background agents via Minions job queue. Submit, monitor, steer, pause/resume, replay. Replaces sessions_spawn for durable observable agents."
+      "description": "Unified Minions skill for deterministic shell jobs and LLM subagent orchestration. Submit, monitor, steer, pause/resume, replay. Replaces the older gbrain-jobs routing intent and sessions_spawn for durable observable background work."
     },
     {
       "name": "skillify",
