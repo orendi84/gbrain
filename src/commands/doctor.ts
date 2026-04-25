@@ -71,21 +71,20 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     }
 
     const report = checkResolvable(skillsDir);
-    if (report.ok && report.issues.length === 0) {
+    if (report.errors.length === 0 && report.warnings.length === 0) {
       checks.push({
         name: 'resolver_health',
         status: 'ok',
         message: `${report.summary.total_skills} skills, all reachable`,
       });
     } else {
-      const errors = report.issues.filter(i => i.severity === 'error');
-      const warnings = report.issues.filter(i => i.severity === 'warning');
-      const status = errors.length > 0 ? 'fail' as const : 'warn' as const;
+      const status = report.errors.length > 0 ? 'fail' as const : 'warn' as const;
+      const total = report.errors.length + report.warnings.length;
       const check: Check = {
         name: 'resolver_health',
         status,
-        message: `${report.issues.length} issue(s): ${errors.length} error(s), ${warnings.length} warning(s)`,
-        issues: report.issues.map(i => ({
+        message: `${total} issue(s): ${report.errors.length} error(s), ${report.warnings.length} warning(s)`,
+        issues: [...report.errors, ...report.warnings].map(i => ({
           type: i.type,
           skill: i.skill,
           action: i.action,
