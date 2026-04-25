@@ -211,8 +211,11 @@ The six daily pains — spawn storms, agents that stop responding, forgotten dis
 gbrain jobs smoke                        # verify install
 gbrain jobs submit sync --params '{}'    # fire a background job
 gbrain jobs stats                        # health dashboard
-gbrain jobs work --concurrency 4         # start a worker (Postgres only)
+gbrain jobs supervisor --concurrency 4   # canonical: auto-restarting worker (Postgres only)
+gbrain jobs work --concurrency 4         # raw worker (no crash recovery — prefer `supervisor`)
 ```
+
+`gbrain jobs supervisor` keeps the worker alive across crashes with exponential backoff, atomic PID locking, structured audit events at `~/.gbrain/audit/supervisor-*.jsonl`, and a `start --detach` / `status --json` / `stop` subcommand surface for agents. In containers it runs as PID 1; on systemd hosts it's the child of `gbrain-worker.service`. Full deployment guide: [`docs/guides/minions-deployment.md`](docs/guides/minions-deployment.md).
 
 Read [`skills/minion-orchestrator/SKILL.md`](skills/minion-orchestrator/SKILL.md) for parent-child DAGs, fan-in collection, steering via inbox.
 
