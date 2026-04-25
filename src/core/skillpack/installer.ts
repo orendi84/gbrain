@@ -186,7 +186,10 @@ function acquireLock(workspace: string, opts: InstallOptions): void {
     const age = Date.now() - existing.mtimeMs;
     // `staleMs: 0` in tests means "any age counts as stale". Use >=
     // so a just-written lock qualifies when the threshold is 0.
-    const stale = age >= staleMs;
+    // Negative age (mtime in the future) happens on fast CI filesystems
+    // where write → stat roundtrip returns an mtime microseconds ahead of
+    // Date.now() — treat it as stale to avoid a "lock held" false positive.
+    const stale = age < 0 || age >= staleMs;
     if (stale && !opts.forceUnlock) {
       throw new InstallError(
         `Stale skillpack lock at ${p} (pid ${existing.pid}, ${Math.round(age / 1000)}s old). Pass --force-unlock to proceed.`,

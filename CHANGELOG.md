@@ -2,6 +2,63 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.20.4] - 2026-04-24
+
+**Minions skill consolidation, now honest about what the CLI actually does.**
+
+One skill for background work instead of two. Shell jobs and LLM subagents land under `skills/minion-orchestrator/` with a shared Preconditions block, accurate CLI examples, and a trigger set narrowed to what the skill actually covers. Corrects four documentation bugs the prior merge shipped ... `submit_job name="shell"` isn't MCP-callable, `research`/`orchestrate` aren't real handler names, PGLite users don't need to migrate to Supabase, and "every background task goes through Minions" contradicts the `pain_triggered` default in `skills/conventions/subagent-routing.md`. The skill now matches the code.
+
+Two new tests guard this surface going forward. `test/resolver.test.ts` gets a round-trip check (every quoted RESOLVER.md trigger must resolve to a frontmatter `triggers:` entry in the target skill) and a name validator (every `name="<word>"` reference in any SKILL.md must resolve to either a declared operation in `src/core/operations.ts` or a known Minions handler). The validator would have caught the `research`/`orchestrate` drift in CI instead of from a Codex cold-read. One new E2E test (`test/e2e/minions-shell-pglite.test.ts`) exercises the PGLite `--follow` inline path, previously documented but untested.
+
+### For users
+
+- Shell jobs via `gbrain jobs submit shell --params '{"cmd":"..."}'` (operator/CLI only ... MCP returns `permission_denied` for protected names). Subagent jobs via `gbrain agent run` (user-facing entrypoint). Both lanes route through one skill.
+- PGLite shell-job guidance now correctly points at `--follow` for inline execution. The persistent daemon mode is still Postgres-only, but you do not need to migrate.
+- `gbrain jobs submit` and `submit a gbrain job` now route to the skill; bare "gbrain jobs" no longer does (it was too broad ... the CLI namespace covers 9 subcommands, and questions about `stats`/`prune`/`retry` fall through to `gbrain --help`).
+
+### Added
+
+- New E2E test `test/e2e/minions-shell-pglite.test.ts` covering the PGLite `--follow` inline shell-job path. Runs in-memory, no DATABASE_URL required.
+- Resolver round-trip test in `test/resolver.test.ts`: every quoted RESOLVER.md trigger must have a fuzzy match in the target skill's frontmatter `triggers:` list.
+- Skill-example-name validator in `test/resolver.test.ts`: every `name="<word>"` reference in any `SKILL.md` body must resolve to an op in `src/core/operations.ts` or a Minions handler in `PROTECTED_JOB_NAMES`.
+
+### Fixed
+
+- `skills/minion-orchestrator/SKILL.md` shell-job examples use the real `--params` JSON form instead of nonexistent `--cmd`/`--argv`/`--cwd` flags.
+- `gbrain agent run` flag list now matches `src/commands/agent.ts` (removed `--queue`/`--priority`/`--max-attempts`/`--delay` which aren't parsed by that command).
+- `--tools` example uses `search,query` instead of `web_search` (the latter isn't in `BRAIN_TOOL_ALLOWLIST`, would throw at submit time).
+- MCP boundary wording says `submit_job name="shell"` throws an `OperationError` with code `permission_denied`, instead of the earlier "returns permission_denied" (not a return, a throw).
+- `skills/conventions/subagent-routing.md` stale reference to `get_job_stats` (no such op) replaced with `list_jobs --status active` or `gbrain jobs stats`.
+- `skills/query/SKILL.md` + `skills/maintain/SKILL.md` frontmatter `triggers:` lists closed gaps the new round-trip test surfaced (RESOLVER.md was routing 10 triggers to these skills that their frontmatter never declared).
+- `skills/manifest.json` minion-orchestrator description updated to match the unified SKILL.md framing.
+
+### Changed
+
+- Trigger `"gbrain jobs"` narrowed to `"gbrain jobs submit"` + `"submit a gbrain job"` in both `skills/RESOLVER.md` and the skill's frontmatter.
+- Anti-pattern about `sessions_spawn` scoped to the subagent lane (was ambiguous in the consolidated skill).
+
+### For contributors
+
+- Code-to-doc drift is now partially machine-checkable. The skill-example-name validator catches T2-class bugs (docs referencing handler/op names that don't exist). CLI flag validation is a remaining gap ... a future PR could extend the test to validate `--flag-name` patterns in SKILL.md against actual CLI flag parsers.
+
+## To take advantage of v0.20.4
+
+Any gbrain user whose agent routes on "minions" work gets the corrected skill on the next `gbrain upgrade`. No manual migration required ... the renamed trigger is additive (old trigger gone, new triggers cover the same intent), and the doc corrections don't change runtime behavior.
+
+1. **Run the orchestrator manually if `gbrain upgrade` reports a partial migration:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Your agent picks up the new skill content** next time it consults `skills/minion-orchestrator/SKILL.md`. No action required on your side.
+3. **Verify the outcome:**
+   ```bash
+   gbrain check-resolvable --json | python3 -c "import json,sys;d=json.load(sys.stdin);print('ok:',d['ok'])"
+   ```
+   Should print `ok: True`.
+4. **If any step fails,** file an issue at https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+
 ## [0.20.3] - 2026-04-24
 
 ## **Your queue now rescues itself when a wedged worker holds a row lock. Wall-clock sweep kills the job that stall detection can't see.**
