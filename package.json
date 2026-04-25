@@ -1,6 +1,6 @@
 {
   "name": "gbrain",
-  "version": "0.19.1",
+  "version": "0.20.0",
   "description": "Postgres-native personal knowledge brain with hybrid RAG search",
   "type": "module",
   "main": "src/core/index.ts",
@@ -13,7 +13,18 @@
     "./types": "./src/core/types.ts",
     "./operations": "./src/core/operations.ts",
     "./minions": "./src/core/minions/index.ts",
-    "./engine-factory": "./src/core/engine-factory.ts"
+    "./engine-factory": "./src/core/engine-factory.ts",
+    "./pglite-engine": "./src/core/pglite-engine.ts",
+    "./link-extraction": "./src/core/link-extraction.ts",
+    "./import-file": "./src/core/import-file.ts",
+    "./transcription": "./src/core/transcription.ts",
+    "./embedding": "./src/core/embedding.ts",
+    "./config": "./src/core/config.ts",
+    "./markdown": "./src/core/markdown.ts",
+    "./backoff": "./src/core/backoff.ts",
+    "./search/hybrid": "./src/core/search/hybrid.ts",
+    "./search/expansion": "./src/core/search/expansion.ts",
+    "./extract": "./src/commands/extract.ts"
   },
   "scripts": {
     "dev": "bun run src/cli.ts",

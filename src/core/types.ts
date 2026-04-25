@@ -1,5 +1,10 @@
 // Page types
-export type PageType = 'person' | 'company' | 'mandate' | 'project' | 'concept' | 'source' | 'media' | 'knowledge' | 'deal' | 'yc' | 'civic' | 'writing' | 'analysis' | 'guide' | 'hardware' | 'architecture' | 'meeting' | 'note';
+// email | slack | calendar-event: native Page types for inbox/chat/calendar
+// ingest (and the amara-life-v1 eval corpus in the sibling gbrain-evals repo).
+// Previously these collapsed into `source`, which lost workflow semantics
+// (e.g. "attended meetings" vs "received emails").
+// mandate | knowledge: Gary's local additions for waiti work-product pages.
+export type PageType = 'person' | 'company' | 'mandate' | 'project' | 'concept' | 'source' | 'media' | 'knowledge' | 'deal' | 'yc' | 'civic' | 'writing' | 'analysis' | 'guide' | 'hardware' | 'architecture' | 'meeting' | 'note' | 'email' | 'slack' | 'calendar-event';
 
 export interface Page {
   id: number;
