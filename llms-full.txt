@@ -675,6 +675,59 @@ GitHub, etc.) are fine — they're public entities, not contacts in anyone's bra
 Do not confuse illustrative API examples with queries that reveal real
 relationships.
 
+## Responsible-disclosure rule: don't broadcast attack surface in release notes
+
+**When a release fixes a security gap or a user-impacting bug, describe the fix
+functionally. Do not enumerate the attack surface, quantify the exposure window,
+or highlight the most sensitive records by name in public-facing artifacts.**
+
+Public-facing artifacts include: `CHANGELOG.md`, `README.md`, `docs/`, PR titles
+and bodies, commit messages, GitHub issue titles and comments, release pages,
+tweets, blog posts.
+
+**Don't write:**
+- "10 tables were publicly readable by the anon key for months, including X, Y, Z"
+- "X and Y are the most sensitive ones"
+- "N tables exposed. Fix: enable RLS on these specific tables: ..."
+
+**Do write:**
+- "Security hardening pass. Fresh installs secure by default. Existing brains
+  brought to the same bar automatically on upgrade."
+- "If `gbrain doctor` still flags anything after upgrade, the message names each
+  table and gives the exact fix."
+
+Why: anyone reading the release page before they've upgraded now has a directed
+probe list for unpatched installs. The source code ships the specifics anyway
+(`src/schema.sql`, `src/core/migrate.ts`, test fixtures) — reverse engineers can
+get them. But the release page is a broadcast channel. Don't hand attackers a
+curated list with a banner.
+
+**The test:** if a reader with no prior context could read the release note and
+walk away knowing "gbrain at version X has table Y readable by anon key until
+they patch," the note is too specific. Rewrite until that's no longer possible.
+
+**What IS fine in public artifacts:**
+- The mechanism of the fix ("the check now scans every public table instead of
+  a hardcoded allowlist").
+- User-facing operator ergonomics (the escape-hatch SQL template, the upgrade
+  commands, the breaking-change flag).
+- Credit to contributors.
+- Generic framing of severity ("security posture tightening pass") without
+  quantification.
+
+**What stays in private artifacts (plan files, private memories, internal docs):**
+- Specific table names, record counts, exposure duration.
+- Which records stand out as highest-risk.
+- Detailed before/after tables in the "numbers that matter" format.
+
+If the CEO/Eng review of a plan produces a detailed exposure table, keep it in
+the plan file under `~/.claude/plans/` or `~/.gstack/projects/`. Don't copy it
+into the CHANGELOG or PR body.
+
+Applies retroactively: if you see a prior CHANGELOG entry naming attack-surface
+specifics, scrub it as a small cleanup commit, the same way a stale Wintermute
+reference gets swept.
+
 ## Schema state tracking
 
 `~/.gbrain/update-state.json` tracks which recommended schema directories the user

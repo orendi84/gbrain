@@ -2,6 +2,173 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.18.2] - 2026-04-23
+
+## **Migrations survive a crash and Supabase's 2-min ceiling.**
+## **`gbrain doctor --locks` finds the connection blocking your upgrade.**
+
+The v0.18.0 production upgrade shipped a field report of 8 issues: statement timeouts, stale idle connections, a schema version that lied, a cryptic FK dependency error. The original PR #356 fix covered all 8. A codex plan-review pass found 3 more that neither the initial review nor the eng review caught. This release lands the lot.
+
+The quiet win: if your brain crashes mid-migration on Postgres, it rolls back cleanly now. Before v0.18.2, a process death between migrations 21 and 23 left your `files` table with no FK to `pages` while uploads kept going. The window is closed. DDL either commits entirely or not at all.
+
+The visible win: `gbrain doctor --locks` works. Before v0.18.2 the 57014 timeout error told you to run this command, but the flag didn't exist. Now it does. It shows you every idle-in-transaction backend older than 5 minutes and gives you the exact `pg_terminate_backend(<pid>)` to free them up. One command, one paste, done.
+
+The large-brain win: `CREATE INDEX CONCURRENTLY` no longer gets killed at 2 minutes. The migration runner now reserves a dedicated connection and sets session-level `statement_timeout='600000'` before running non-transactional DDL. Brains at 500K+ pages can run the next schema change without timing out silently.
+
+### The numbers that matter
+
+Counted against the v0.18.0 field report (the production upgrade that prompted this release):
+
+| Metric | BEFORE v0.18.2 | AFTER v0.18.2 | Δ |
+|--------|----------------|---------------|---|
+| Field-report issues causing production failure | 8 | 0 | −8 |
+| Integrity windows between migrations | 1 (v21 → v23) | 0 | −1 |
+| `CREATE INDEX CONCURRENTLY` exposed to 2-min timeout | yes | no (10-min override) | fixed |
+| Agent-runnable lock diagnostic | missing | `gbrain doctor --locks` | added |
+| Regression tests on hardening paths | structural SQL asserts only | 10 unit + 11 real-PG E2E | +21 |
+| 57014 error: references a flag that exists | no | yes | fixed |
+
+The striking number: 3 of the 11 findings in this release came from a second AI model (codex) reviewing the plan after the first model (Claude) had already cleared CEO + Eng review. Two-model review catches what one-model review misses. The migration-21 integrity window in particular would have shipped as a new bug if the plan hadn't been challenged.
+
+### What this means for your workflow
+
+Most users: run `gbrain upgrade`. Nothing else to do. Existing brains at schema v21 or v22 are safe, the old FK stayed intact through the original PR #356 path, and the new atomic commit means a future crash can't leave you stranded.
+
+If a migration hits `statement_timeout`, the error message now tells you exactly what to do: `gbrain doctor --locks` to find the blocker, terminate, re-run `gbrain apply-migrations --yes`, verify with `gbrain doctor`. Four commands, top-to-bottom.
+
+Running a 500K-page brain on Supabase? The next migration that touches a hot table won't hang silently on you.
+
+### Itemized changes
+
+#### Added
+
+- `gbrain doctor --locks`: lists idle-in-transaction backends older than 5 minutes with PID + `pg_terminate_backend` commands. Exits 1 when blockers found. `--json` emits structured output. Postgres-only; PGLite prints "not applicable".
+- `BrainEngine.withReservedConnection(fn)`: runs callback on a dedicated pool connection. Postgres via `sql.reserve()`, PGLite as a pass-through.
+
+#### Changed
+
+- Migration 21 split into engine-specific paths. Postgres is additive-only (adds `pages.source_id` + index). PGLite gets the full UNIQUE-key swap inline. The FK drop + UNIQUE swap that used to live in v21 moved into v23's handler.
+- Migration 23 handler now wraps its entire DDL sequence (FK drop, UNIQUE swap, `files.source_id` + `files.page_id` addition, `page_id` backfill, `file_migration_ledger` creation) in a single `engine.transaction()`. Atomic commit; process-death rolls back to v22 state.
+- Non-transactional migrations (`CREATE INDEX CONCURRENTLY`) now run on a reserved connection with session-level `SET statement_timeout='600000'`. Safe on PgBouncer transaction pooling because the connection is isolated from the shared pool.
+- 57014 (`statement_timeout`) diagnostic rewritten to the 4-part pattern: what happened, why, exact commands to fix, how to verify.
+
+#### Fixed
+
+- Migration 21 integrity window. Previously v21 dropped `files_page_slug_fkey` and persisted `config.version=21`, but the replacement `files.page_id` column wasn't added until v23. Process-death between them left `files` unconstrained while `file_upload` / `gbrain files` kept accepting writes. The FK drop now lives inside v23's atomic transaction.
+- `gbrain doctor --locks` flag referenced by the v0.18.0 57014 error message but not implemented. The flag exists now.
+
+#### For contributors
+
+- `setSessionDefaults(sql)` helper in `src/core/db.ts` absorbs the duplicated `idle_in_transaction_session_timeout` block from `postgres-engine.ts`. Both connect paths call the helper; the SET appears exactly once in source.
+- `getIdleBlockers(engine)` exported from `src/core/migrate.ts`: single source of truth for the `pg_stat_activity` query. Shared by the pre-flight warning and `gbrain doctor --locks`.
+- `ReservedConnection` interface exposes `executeRaw(sql, params?)` only. Minimal surface, easy to mock. Not safe to call from inside `transaction()`; the interface doc says so.
+- `test/e2e/helpers.ts` adds `runMigrationsUpTo(engine, targetVersion)` + `setConfigVersion(version)`: enables mid-chain migration tests that neither `gbrain init --migrate-only` nor the existing `setupDB()` supported.
+- `test/migrate.test.ts`: 10 new regression guards (`Math.max` robustness under array scrambling, `getIdleBlockers` shape across engines, 57014 catch path structural check, pre-flight warning, `setSessionDefaults` DRY, reserved-connection usage in `runMigrationSQL`).
+- `test/e2e/migrate-chain.test.ts` (new): 11 E2E tests against real Postgres covering post-chain schema invariants, `doctor --locks` real-connection detection, `runMigrationsUpTo` advancement semantics, `withReservedConnection` round-trip.
+
+Credit: codex plan-review caught the migration-21 integrity window, the non-transactional DDL timeout gap, and the missing `doctor --locks` CLI. The initial Claude review and the Claude-model eng review both missed them.
+
+## To take advantage of v0.18.2
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor`
+warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Verify the outcome:**
+   ```bash
+   gbrain doctor              # schema_version should match latest
+   gbrain doctor --locks      # should exit 0 (no idle-in-tx blockers)
+   ```
+3. **If `statement_timeout` fires during migration,** the new 4-part diagnostic
+   tells you exactly what to do: run `gbrain doctor --locks`, terminate
+   blockers, re-run `gbrain apply-migrations --yes`.
+4. **If anything fails,** file an issue: https://github.com/garrytan/gbrain/issues
+   with output of `gbrain doctor` and `~/.gbrain/upgrade-errors.jsonl` (if it
+   exists).
+
+## [0.18.1] - 2026-04-22
+
+## **Row Level Security hardening pass.**
+## **Fresh installs secure by default. Existing brains are brought up to the same bar automatically on upgrade.**
+
+A security-posture tightening release. `gbrain doctor` now enforces RLS across the entire `public` schema (not a hardcoded allowlist), the base schema ships every gbrain-managed table with RLS enabled, and an automatic migration runs on `gbrain upgrade` to bring older installs to the same state. After `gbrain upgrade` (or `gbrain apply-migrations --yes`), `gbrain doctor` should report clean on healthy brains.
+
+The doctor check severity upgrades from `warn` to `fail`. Missing RLS is a security issue, not a suggestion. `gbrain doctor` exits 1 when any public table is missing RLS. If you wrap `gbrain doctor` in a cron or CI health check, expect it to flip red on setups that haven't upgraded.
+
+There is an escape hatch for tables you deliberately want readable by the anon key (analytics views, public materialized views, plugin tables that use anon reads on purpose). It is a Postgres `COMMENT ON TABLE` with a `GBRAIN:RLS_EXEMPT reason=<why>` prefix. No CLI subcommand. You drop to psql and type the reason. Full details in [docs/guides/rls-and-you.md](docs/guides/rls-and-you.md). The escape hatch is deliberately painful because the default should be closed.
+
+### What changes
+
+| Area | BEFORE v0.18.1 | AFTER v0.18.1 |
+|------|----------------|---------------|
+| Scope of doctor RLS check | hardcoded allowlist | every `pg_tables` row in `public` |
+| Severity when RLS missing | warn (exit 0) | fail (exit 1) |
+| Escape hatch for intentional anon-readable tables | none | `GBRAIN:RLS_EXEMPT reason=...` pg comment |
+| Identifier-safe remediation SQL | no | yes (`ALTER TABLE "public"."<name>"`) |
+| PGLite doctor output for RLS | misleading warn | clean `ok` with skip reason |
+| Exemption list surfaced on every doctor run | n/a | enumerated by name |
+
+### What this means for your workflow
+
+Existing Supabase brains: run `gbrain upgrade`, then `gbrain doctor`. Everything managed by gbrain should report clean. If doctor flags something, it's a plugin, user-created, or extension table — the message names each one and gives you the exact `ALTER TABLE` line.
+
+PGLite brains (the `gbrain init` default): nothing to do. RLS is irrelevant on embedded Postgres. Doctor skips the check with an explicit message.
+
+Cron and CI wrappers: audit them. The exit-code flip is the one breaking change in this release. If a table is anon-readable on purpose, use the `GBRAIN:RLS_EXEMPT` comment escape hatch rather than silencing the whole check.
+
+Credit: Garry's OpenClaw for the original check-widening PR (#336). Codex found additional gaps during plan review.
+
+## To take advantage of v0.18.1
+
+`gbrain upgrade` should do this automatically. It runs `gbrain post-upgrade`,
+which calls `gbrain apply-migrations --yes`, which runs the v0.18.1 orchestrator.
+If `gbrain doctor` still reports missing RLS after upgrade:
+
+1. **Apply migrations manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Re-run the health check:**
+   ```bash
+   gbrain doctor
+   ```
+3. **If specific tables still fail**, the doctor message names each one and gives you the fix. Example:
+   ```
+   1 table(s) WITHOUT Row Level Security: my_plugin_state. Fix: ALTER TABLE "public"."my_plugin_state" ENABLE ROW LEVEL SECURITY;
+   ```
+4. **If a table should stay readable by the anon key on purpose**, use the escape hatch (see `docs/guides/rls-and-you.md`):
+   ```sql
+   COMMENT ON TABLE public.my_analytics_view IS
+     'GBRAIN:RLS_EXEMPT reason=analytics-only, anon-readable ok, owner=you, date=2026-04-22';
+   ```
+5. **If any step fails or the numbers look wrong**, please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor --json`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+   This feedback loop is how the gbrain maintainers find fragile upgrade paths. Thank you.
+
+### Itemized changes
+
+- **Schema + migration:** `src/schema.sql` and `src/core/schema-embedded.ts` ensure every gbrain-managed public table ships with RLS enabled for fresh installs. A new schema migration in `src/core/migrate.ts` backfills existing brains to the same state. The migration is gated on `rolbypassrls` and fails loudly if the current role lacks BYPASSRLS (so `schema_version` stays at the prior value and retries cleanly after role assignment).
+- **Upgrade orchestrator:** New `src/commands/migrations/v0_18_1.ts` wires the schema migration into the `gbrain apply-migrations --yes` path (mirrors v0.18.0's Phase A pattern).
+- **Doctor check widened:** `src/commands/doctor.ts` RLS check now scans every public table from `pg_tables` rather than a hardcoded allowlist. Severity upgraded `warn → fail`. Success message shows table count. Failure message includes per-table quoted `ALTER TABLE "public"."<name>" ENABLE ROW LEVEL SECURITY;` remediation SQL.
+- **Escape hatch — "write it in blood":** Doctor reads `obj_description` for each non-RLS public table. Tables whose comment matches `^GBRAIN:RLS_EXEMPT\s+reason=\S.{3,}` count as explicitly exempt. Exempt tables are enumerated by name on every successful doctor run so the exemption list never goes invisible. No CLI subcommand — deliberate friction; operators must set the comment in psql.
+- **PGLite skip:** PGLite is embedded and single-user with no PostgREST; the RLS check now skips on PGLite with an explicit `ok` message ("Skipped — no PostgREST exposure, RLS not applicable") instead of the misleading `warn` it emitted before. Partial polish: pgvector, jsonb_integrity, and markdown_body_completeness checks still hit the same `getConnection()` throw → warn pattern on PGLite. Separate follow-up.
+- **Tests:**
+  - `test/doctor.test.ts` gains source-grep structural regression guards covering scan scope, fail severity + quoted-identifier remediation, PGLite skip wrapper, and `GBRAIN:RLS_EXEMPT` parsing.
+  - `test/e2e/mechanical.test.ts` `E2E: RLS Verification` block rewritten. The old allowlist-query test is replaced with an every-public-table-has-RLS assertion; new CLI-spawn tests verify fail-on-no-RLS (with exit code + ALTER TABLE in JSON message), exempt-with-valid-reason passes, empty-reason exemption fails, and unrelated comment still fails. All helpers use `try/finally` with unique suffix-per-run table names.
+  - `test/migrate.test.ts` gains a structural guard for the new migration: exists, name matches, BYPASSRLS gating present, LATEST_VERSION has advanced.
+- **Docs:** new `docs/guides/rls-and-you.md` — one-page explainer covering why RLS matters, what to do when doctor fails, the escape hatch format + rules, auditing exemptions, PGLite behavior, self-hosted Postgres framing.
+- **Version reconciliation:** `VERSION` and `package.json` land on `0.18.1`.
+- **CHANGELOG privacy sweep:** replaced a stale `@Wintermute` credit in the 0.17.0 entry with "Garry's OpenClaw" per the [CLAUDE.md privacy rule](CLAUDE.md).
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
 ## [0.18.0] - 2026-04-22
 
 ## **Multi-source brains. One database, many repos. Federated or isolated, you choose.**
@@ -137,7 +304,7 @@ Autopilot users: nothing to do. Your daemon picks up the new phases on next cycl
 
 Reviewers/codex caught three plan-breakers during multi-round review that would have shipped silent DB writes on dry-run: (1) `performSync`'s full-sync path was ignoring `opts.dryRun`, (2) `runEmbedCore` had no dry-run mode and returned void, (3) `findOrphans` used `db.getConnection()` global and didn't compose with a passed engine. All three are fixed as preconditions (commits 1-3 of the 6-commit bisectable series).
 
-Credit: @Wintermute for the original `gbrain dream` thesis (PR #309). The brand-promise framing survived; the implementation got redesigned from scratch around the runCycle primitive after CEO + Eng + Codex + DX review found structural issues.
+Credit: Garry's OpenClaw for the original `gbrain dream` thesis (PR #309). The brand-promise framing survived; the implementation got redesigned from scratch around the runCycle primitive after CEO + Eng + Codex + DX review found structural issues.
 
 ## To take advantage of v0.17.0
 
