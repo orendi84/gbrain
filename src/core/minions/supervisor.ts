@@ -75,6 +75,9 @@ export interface SupervisorOpts {
   allowShellJobs: boolean;
   /** JSON mode: emit JSONL events on stderr, reserve stdout for data payloads. Default: false. */
   json: boolean;
+  /** RSS threshold (MB) passed to the spawned worker as `--max-rss N`.
+   *  Default: 2048. Set to 0 to spawn the worker without a watchdog. */
+  maxRssMb: number;
   /** Optional event sink (Lane C audit writer). Called for every lifecycle event. */
   onEvent?: (event: SupervisorEmission) => void;
   /**
@@ -101,6 +104,7 @@ const DEFAULTS: Omit<SupervisorOpts, 'cliPath'> = {
   healthInterval: 60_000,
   allowShellJobs: false,
   json: false,
+  maxRssMb: 2048,
 };
 
 /** Calculate backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s cap. */
@@ -411,6 +415,9 @@ export class MinionSupervisor {
         '--concurrency', String(this.opts.concurrency),
         '--queue', this.opts.queue,
       ];
+      if (this.opts.maxRssMb > 0) {
+        args.push('--max-rss', String(this.opts.maxRssMb));
+      }
 
       // Build child env. Explicit handling for GBRAIN_ALLOW_SHELL_JOBS:
       // inherit only when caller opts in, otherwise strip from the clone.

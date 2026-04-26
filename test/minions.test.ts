@@ -1897,6 +1897,261 @@ describe('MinionQueue: v0.19.1 wall-clock + handleTimeouts non-interference (T1)
   });
 });
 
+// --- v0.22.2: RSS watchdog (--max-rss + periodic timer + gracefulShutdown) ---
+
+describe('MinionWorker: --max-rss watchdog', () => {
+  // Helper: build a worker with deterministic RSS injection. Tests pass a
+  // sequence of bytes; getRss() returns elements in order, repeating the last.
+  function makeRssSequence(values: number[]): () => number {
+    let i = 0;
+    return () => {
+      const v = values[Math.min(i, values.length - 1)];
+      i++;
+      return v;
+    };
+  }
+
+  test('per-job check: handler bumps RSS, post-job check trips, sibling aborts', async () => {
+    // 100MB threshold. RSS reads always return 250MB → first post-job check
+    // (after the 'quick' handler completes) trips and the 'slow' sibling
+    // sees its abort signal flip.
+    const worker = new MinionWorker(engine, {
+      queue: 'default',
+      concurrency: 2,
+      maxRssMb: 100,
+      getRss: () => 250 * 1024 * 1024,
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      rssCheckInterval: 60_000, // disable periodic — exercise per-job only
+    });
+
+    let sibling2Aborted = false;
+    let sibling2Resolved = false;
+    let sibling1Done = false;
+
+    worker.register('quick', async () => {
+      // Resolves immediately. Triggers post-job check.
+      sibling1Done = true;
+    });
+    worker.register('slow', async (job) => {
+      // Long-running sibling. Watch for abort signal.
+      job.signal.addEventListener('abort', () => { sibling2Aborted = true; });
+      await new Promise<void>((resolve) => {
+        const t = setInterval(() => {
+          if (job.signal.aborted) { clearInterval(t); sibling2Resolved = true; resolve(); }
+        }, 20);
+      });
+    });
+
+    await queue.add('slow', {});
+    await queue.add('quick', {});
+
+    await worker.start(); // returns when stop() flips and drain completes
+
+    expect(sibling1Done).toBe(true);
+    expect(sibling2Aborted).toBe(true);
+    expect(sibling2Resolved).toBe(true);
+  }, 60_000);
+
+  test('periodic timer: zero job completions, watchdog still fires', async () => {
+    // Threshold 100MB. RSS = 250MB on every call. No job ever completes.
+    const worker = new MinionWorker(engine, {
+      queue: 'default',
+      concurrency: 1,
+      maxRssMb: 100,
+      getRss: () => 250 * 1024 * 1024,
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      rssCheckInterval: 100, // fire fast in tests
+    });
+
+    let abortedDuringHandler = false;
+
+    worker.register('forever', async (job) => {
+      // Never returns naturally. Wait on abort.
+      await new Promise<void>((resolve) => {
+        const t = setInterval(() => {
+          if (job.signal.aborted) {
+            abortedDuringHandler = true;
+            clearInterval(t);
+            resolve();
+          }
+        }, 20);
+      });
+    });
+
+    await queue.add('forever', {});
+
+    await worker.start();
+
+    expect(abortedDuringHandler).toBe(true);
+  }, 60_000);
+
+  test('shutdownAbort fires (closes shell-handler zombie gap)', async () => {
+    const worker = new MinionWorker(engine, {
+      queue: 'default',
+      concurrency: 1,
+      maxRssMb: 100,
+      getRss: () => 250 * 1024 * 1024,
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      rssCheckInterval: 100,
+    });
+
+    let shutdownSignalFired = false;
+
+    worker.register('observer', async (job) => {
+      // Subscribes to shutdownSignal — same pattern as shell.ts
+      job.shutdownSignal.addEventListener('abort', () => { shutdownSignalFired = true; });
+      await new Promise<void>((resolve) => {
+        const t = setInterval(() => {
+          if (job.signal.aborted) { clearInterval(t); resolve(); }
+        }, 20);
+      });
+    });
+
+    await queue.add('observer', {});
+    await worker.start();
+
+    expect(shutdownSignalFired).toBe(true);
+  }, 60_000);
+
+  test('below threshold: no-op (no shutdown)', async () => {
+    let postJobCount = 0;
+    const worker = new MinionWorker(engine, {
+      queue: 'default',
+      concurrency: 1,
+      maxRssMb: 1024,
+      getRss: () => { postJobCount++; return 50 * 1024 * 1024; }, // always 50MB, way under
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      rssCheckInterval: 60_000,
+    });
+
+    worker.register('noop', async () => {});
+
+    await queue.add('noop', {});
+    await queue.add('noop', {});
+    await queue.add('noop', {});
+
+    // Run for a moment, then stop manually
+    const startPromise = worker.start();
+    await new Promise(r => setTimeout(r, 500));
+    worker.stop();
+    await startPromise;
+
+    // Watchdog never tripped → all 3 jobs completed
+    const completed = await queue.getJobs({ status: 'completed' });
+    expect(completed.length).toBe(3);
+    expect(postJobCount).toBeGreaterThanOrEqual(3); // checkMemoryLimit ran each time
+  }, 60_000);
+
+  test('maxRssMb=0 disables watchdog entirely', async () => {
+    const worker = new MinionWorker(engine, {
+      queue: 'default',
+      concurrency: 1,
+      maxRssMb: 0,
+      getRss: () => 999_999 * 1024 * 1024, // huge, but disabled
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      rssCheckInterval: 100,
+    });
+
+    worker.register('noop', async () => {});
+    await queue.add('noop', {});
+
+    const startPromise = worker.start();
+    await new Promise(r => setTimeout(r, 500));
+    worker.stop();
+    await startPromise;
+
+    const completed = await queue.getJobs({ status: 'completed' });
+    expect(completed.length).toBe(1);
+  }, 60_000);
+});
+
+// --- v0.21: connectWithRetry + isRetryableDbConnectError ---
+
+describe('connectWithRetry / isRetryableDbConnectError', () => {
+  test('isRetryableDbConnectError matches transient patterns', async () => {
+    const { isRetryableDbConnectError } = await import('../src/core/db.ts');
+    expect(isRetryableDbConnectError(new Error('password authentication failed for user postgres'))).toBe(true);
+    expect(isRetryableDbConnectError(new Error('connection refused'))).toBe(true);
+    expect(isRetryableDbConnectError(new Error('the database system is starting up'))).toBe(true);
+    expect(isRetryableDbConnectError(new Error('Connection terminated unexpectedly'))).toBe(true);
+    expect(isRetryableDbConnectError(new Error('something happened: ECONNRESET'))).toBe(true);
+  });
+
+  test('isRetryableDbConnectError rejects permanent errors', async () => {
+    const { isRetryableDbConnectError } = await import('../src/core/db.ts');
+    expect(isRetryableDbConnectError(new Error('extension "vector" does not exist'))).toBe(false);
+    expect(isRetryableDbConnectError(new Error('relation "pages" does not exist'))).toBe(false);
+    expect(isRetryableDbConnectError(new Error('syntax error at end of input'))).toBe(false);
+  });
+
+  test('connectWithRetry: 1st rejects transient, 2nd succeeds', async () => {
+    const { connectWithRetry } = await import('../src/core/db.ts');
+    let attempts = 0;
+    const fakeEngine = {
+      connect: async () => {
+        attempts++;
+        if (attempts === 1) throw new Error('password authentication failed for user postgres');
+      },
+    } as unknown as Parameters<typeof connectWithRetry>[0];
+
+    await connectWithRetry(fakeEngine, { database_url: 'postgres://x' }, { baseDelayMs: 1, log: () => {} });
+    expect(attempts).toBe(2);
+  });
+
+  test('connectWithRetry: 3 transient rejects → throws', async () => {
+    const { connectWithRetry } = await import('../src/core/db.ts');
+    let attempts = 0;
+    const fakeEngine = {
+      connect: async () => {
+        attempts++;
+        throw new Error('connection refused');
+      },
+    } as unknown as Parameters<typeof connectWithRetry>[0];
+
+    await expect(
+      connectWithRetry(fakeEngine, { database_url: 'postgres://x' }, { baseDelayMs: 1, log: () => {} })
+    ).rejects.toThrow('connection refused');
+    expect(attempts).toBe(3);
+  });
+
+  test('connectWithRetry: permanent error does NOT retry', async () => {
+    const { connectWithRetry } = await import('../src/core/db.ts');
+    let attempts = 0;
+    const fakeEngine = {
+      connect: async () => {
+        attempts++;
+        throw new Error('extension "vector" does not exist');
+      },
+    } as unknown as Parameters<typeof connectWithRetry>[0];
+
+    await expect(
+      connectWithRetry(fakeEngine, { database_url: 'postgres://x' }, { baseDelayMs: 1, log: () => {} })
+    ).rejects.toThrow('extension "vector"');
+    expect(attempts).toBe(1);
+  });
+
+  test('connectWithRetry: noRetry honored', async () => {
+    const { connectWithRetry } = await import('../src/core/db.ts');
+    let attempts = 0;
+    const fakeEngine = {
+      connect: async () => {
+        attempts++;
+        throw new Error('connection refused');
+      },
+    } as unknown as Parameters<typeof connectWithRetry>[0];
+
+    await expect(
+      connectWithRetry(fakeEngine, { database_url: 'postgres://x' }, { noRetry: true, log: () => {} })
+    ).rejects.toThrow();
+    expect(attempts).toBe(1);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Abort signal propagation + force-eviction (v0.20.5 cycle-abort fix)
 // ---------------------------------------------------------------------------

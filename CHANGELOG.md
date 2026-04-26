@@ -2,6 +2,84 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.22.2] - 2026-04-26
+
+**Worker no longer freezes silently. Restart-on-RSS, cold-start retry, autopilot backpressure.**
+
+The minions worker has been freezing every few hours in production. RSS climbs from 68 MB at boot to ~15 GB over ~7 hours, the process stops claiming jobs but never crashes (no OOM, no SIGSEGV), the cron keeps enqueuing autopilot-cycle jobs every 5 minutes into a queue nobody is draining, and within 2-3 hours the queue piles up to 28+ waiting jobs. Shell jobs in flight when the worker froze hit `max_stalled` and dead-letter, producing an 18% shell-job failure rate over 24h. The brainstorm caught the root chain ... memory leak, wedged worker, supervisor cold-start race, no backpressure ... and v0.22.2 ships the three in-repo defenses that close the cascade end-to-end while the underlying memory leak gets investigated separately.
+
+The watchdog is the keystone. The worker now self-terminates when RSS crosses a threshold (default 2048 MB under the supervisor) and the supervisor's exponential-backoff respawn picks up a fresh process. Both per-job AND a 60-second periodic timer check, so the watchdog still fires when every concurrency slot is wedged and zero jobs are completing ... the actual production freeze pattern. On trip, the worker fires `shutdownAbort` (so the shell handler runs its SIGTERM→5s→SIGKILL cleanup on child processes) and aborts every per-job signal (so cooperative handlers bail instead of waiting out the 30s drain). Closes the zombie-shell-children gap a Codex review surfaced.
+
+Cold-start auth races on container boot are gone. Every CLI command's `connectEngine()` bootstrap retries transient errors (3 attempts, 1s/2s/4s backoff) by default. PgBouncer rejecting the first connect on a freshly-pinged Supabase pooler is the production failure mode that killed autopilot on cold start; the retry handles it transparently. Operators who genuinely want fail-fast on a misconfigured `DATABASE_URL` pass `--no-retry-connect` or set `GBRAIN_NO_RETRY_CONNECT=1`.
+
+Autopilot stops piling jobs into a dead queue. `autopilot-cycle` submissions now use `maxWaiting: 1` so the v0.19.1 `pg_advisory_xact_lock` coalesce path caps the queue at 1 active + 1 waiting instead of letting it grow unbounded. The 3rd+ submission coalesces and writes a backpressure-audit JSONL line. Combined with the existing per-slot `idempotency_key`, cross-slot pile-ups are bounded.
+
+### The numbers that matter
+
+Production data from the 2026-04-25 incident, plus the watchdog defaults:
+
+| Metric                                  | Before          | After (supervised path) |
+|-----------------------------------------|-----------------|-------------------------|
+| Waiting-jobs pileup at freeze           | 28+             | 2 (capped at 1+1)       |
+| Worker RSS at freeze                    | 14.8 GB         | ~2 GB self-terminate    |
+| Time to detect freeze                   | hours (manual)  | ≤60s (periodic timer)   |
+| Cold-start auth-fail recovery           | manual restart  | 3 attempts in ~7s       |
+
+Bare `gbrain jobs work` (operators not using the supervisor) keeps current unbounded behavior to preserve workloads with legitimately large embed/import working sets ... pass `--max-rss N` explicitly to enable the watchdog there.
+
+### What this means for operators
+
+If you run `gbrain jobs supervisor` (the production-recommended path), `gbrain upgrade` is the only step. The supervisor injects `--max-rss 2048` to its spawned worker by default; hourly watchdog exits look like clean shutdowns to the supervisor's stable-run reset, not crashes. If you run `gbrain autopilot --install`, the autopilot's worker spawn loop now has the same stable-run reset pattern, so a watchdog-driven exit every hour does NOT trip the give-up-after-5-crashes threshold. If your container hits zombie process accumulation, add `--init` to `docker run` or `tini` as PID 1 ... that's a host-side concern, not a gbrain change.
+
+## To take advantage of v0.22.2
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **No manual SKILL.md or AGENTS.md edits required.** This release is code-only ... no schema changes, no new skills.
+3. **Verify the watchdog is wired (Postgres + supervisor path):**
+   ```bash
+   gbrain jobs supervisor --json &
+   ps -ef | grep "gbrain jobs work" | grep -- "--max-rss 2048"
+   ```
+   You should see the spawned worker child carrying `--max-rss 2048` in its argv.
+4. **If you supervise via `gbrain autopilot --install`,** the watchdog gets injected automatically. Existing crontab/launchd/systemd installs do not need to be reinstalled ... the autopilot binary picks up the new spawn args on next restart.
+5. **For hosts hitting zombie process accumulation** (PID-table fills up over weeks): add `--init` to `docker run`, or set `tini` as PID 1 in your Dockerfile. Not a gbrain code change ... operational note.
+6. **If any step fails or behavior looks off,** please file an issue at https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor` and the contents of `~/.gbrain/upgrade-errors.jsonl` if it exists.
+
+### Itemized changes
+
+#### Added
+
+- `MinionWorkerOpts` gains `maxRssMb`, `getRss`, and `rssCheckInterval` ... watchdog plumbing with a deterministic-test seam for the RSS readback.
+- `MinionWorker.gracefulShutdown(reason)` ... unified-style shutdown that fires `shutdownAbort` + per-job aborts + `running=false`. Reused by the per-job and periodic-timer check sites.
+- 60-second periodic RSS check (`rssCheckInterval` default 60_000) running alongside the existing stalled-jobs timer in `start()`. Closes the freeze-with-zero-completions production scenario.
+- `--max-rss MB` flag on `gbrain jobs work` (no default, opt-in for bare workers) and `gbrain jobs supervisor` (default 2048). `--max-rss 0` disables; `< 256` errors out as a likely GB-vs-MB unit-confusion typo.
+- `connectWithRetry()` + `isRetryableDbConnectError()` in `src/core/db.ts`. 5-pattern transient-error matcher (auth-failed, connection-refused, db-starting, terminated-unexpectedly, ECONNRESET). Permanent errors (extension-missing, schema conflicts) do NOT retry.
+- `--no-retry-connect` flag and `GBRAIN_NO_RETRY_CONNECT=1` env var ... operator escape hatch for fail-fast on misconfigured DATABASE_URL.
+- Autopilot worker spawn now carries `--max-rss 2048` and a stable-run reset window (5 minutes uptime → reset crash counter to 1). Mirrors the supervisor pattern at `supervisor.ts:471-476` so hourly watchdog exits don't kill autopilot after ~5 hours.
+- `autopilot-cycle` submission passes `maxWaiting: 1` to `queue.add()`. Combined with the existing per-slot `idempotency_key`, this caps cross-slot queue depth at 1 active + 1 waiting.
+- 11 new tests in `test/minions.test.ts` covering the watchdog (5 cases including the production-freeze-regression case where zero jobs ever complete) and `connectWithRetry` (6 cases including the noRetry opt-out, transient/permanent error distinction, and successful retry).
+- New supervisor integration test asserting `--max-rss 2048` lands in the spawned worker's argv by default.
+
+#### Changed
+
+- `MinionSupervisor` `SupervisorOpts` gains `maxRssMb` (default 2048). The spawn-args builder appends `--max-rss N` when `maxRssMb > 0`.
+- `connectEngine()` in `src/cli.ts` now wraps `engine.connect()` in `connectWithRetry` by default. Behavior change for cold-start auth races; preserve original fail-fast with `--no-retry-connect` per call site.
+
+#### Out of scope (follow-ups)
+
+- The 40 MB/job memory leak itself ... separate investigation needs heap snapshots and a real reproducer. The watchdog removes urgency.
+- Zombie process reaping via `tini` or `--init` ... Render/Docker host-side configuration, documented above.
+- Refactoring SIGTERM/SIGINT/watchdog into one `unifiedShutdown(reason)` helper ... right shape long-term, premature for this PR.
+
+### For contributors
+
+- The watchdog cleanup path (`gracefulShutdown`) is intentionally co-located with `MinionWorker.stop()`. When a third caller appears (e.g., a future `pause()` method), extracting `unifiedShutdown(reason)` becomes worth the refactor. Until then, three lines is not a DRY emergency.
+- `isRetryableDbConnectError()` lives in `src/core/db.ts` and owns its own 5-pattern matcher. PR #406 (when it merges) introduces a 13-pattern matcher in `src/core/minions/supervisor.ts`; the right move at that merge is to delete the supervisor's local copy and import from `db.ts` (correct dependency direction, low → high). A follow-up TODO captures this.
 ## [0.22.1] - 2026-04-26
 
 **Autopilot stops being a noisy neighbor.**

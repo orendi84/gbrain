@@ -1,6 +1,7 @@
 import postgres from 'postgres';
 import { GBrainError, type EngineConfig } from './types.ts';
 import { SCHEMA_SQL } from './schema-embedded.ts';
+import type { BrainEngine } from './engine.ts';
 
 let sql: ReturnType<typeof postgres> | null = null;
 let connectedUrl: string | null = null;
@@ -241,4 +242,57 @@ export async function withTransaction<T>(fn: (tx: ReturnType<typeof postgres>) =
   return conn.begin(async (tx) => {
     return fn(tx as unknown as ReturnType<typeof postgres>);
   }) as Promise<T>;
+}
+
+const RETRYABLE_DB_CONNECT_PATTERNS = [
+  /password authentication failed/i,
+  /connection refused/i,
+  /the database system is starting up/i,
+  /Connection terminated unexpectedly/i,
+  /ECONNRESET/i,
+];
+
+export function isRetryableDbConnectError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (!msg) return false;
+  return RETRYABLE_DB_CONNECT_PATTERNS.some(p => p.test(msg));
+}
+
+export interface ConnectWithRetryOpts {
+  attempts?: number;
+  baseDelayMs?: number;
+  noRetry?: boolean;
+  log?: (line: string) => void;
+}
+
+export async function connectWithRetry(
+  engine: BrainEngine,
+  config: EngineConfig & { poolSize?: number },
+  opts: ConnectWithRetryOpts = {},
+): Promise<void> {
+  const noRetry = opts.noRetry ?? (process.env.GBRAIN_NO_RETRY_CONNECT === '1');
+  const attempts = noRetry ? 1 : (opts.attempts ?? 3);
+  const baseDelayMs = opts.baseDelayMs ?? 1000;
+  const log = opts.log ?? ((line) => console.warn(line));
+
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await engine.connect(config);
+      return;
+    } catch (e: unknown) {
+      lastErr = e;
+      const retryable = isRetryableDbConnectError(e);
+      const isLast = i === attempts - 1;
+      if (!retryable || isLast) {
+        throw e;
+      }
+      const delay = baseDelayMs * Math.pow(2, i);
+      const msg = e instanceof Error ? e.message : String(e);
+      log(`[connect] attempt ${i + 1} failed (${msg.slice(0, 80)}), retrying in ${delay}ms`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  // Unreachable, but TS needs the throw.
+  throw lastErr;
 }
