@@ -106,16 +106,22 @@ describe('runEmbed --all (parallel)', () => {
   });
 
   test('skips pages whose chunks are all already embedded when --stale', async () => {
-    const pages = [{ slug: 'fresh' }, { slug: 'stale' }];
     const chunksBySlug = new Map<string, any[]>([
       ['fresh', [{ chunk_index: 0, chunk_text: 'hi', chunk_source: 'compiled_truth', embedded_at: '2026-01-01', token_count: 1 }]],
       ['stale', [{ chunk_index: 0, chunk_text: 'hi', chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 }]],
     ]);
+    // Stale path uses countStaleChunks + listStaleChunks (SQL-side filter), not listPages.
+    const stale = [
+      { slug: 'stale', chunk_index: 0, chunk_text: 'hi', chunk_source: 'compiled_truth', model: null, token_count: 1 },
+    ];
 
     const engine = mockEngine({
-      listPages: async () => pages,
+      countStaleChunks: async () => 1,
+      listStaleChunks: async () => stale,
+      // listSlugsPendingEmbedding runs in parallel with countStaleChunks in the
+      // staleOnly path; same slug set as bySlug for this test (no zero-chunk
+      // pages, so the union is just the stale-rows slugs).
       listSlugsPendingEmbedding: async () => ['stale'],
-      getPage: async (slug: string) => pages.find(p => p.slug === slug) ?? null,
       getChunks: async (slug: string) => chunksBySlug.get(slug) || [],
       upsertChunks: async () => {},
     });
@@ -265,10 +271,18 @@ describe('runEmbed --all (parallel)', () => {
         [{ chunk_index: 0, chunk_text: `t ${s}`, chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 }],
       ]),
     );
+    // Stale-rows path: every slug has exactly one chunk with embedding IS NULL,
+    // so listStaleChunks returns 500 rows. embedAllStale must take the
+    // merge-preserve branch (no getPage call) for each.
+    const staleRows = staleSlugs.map(s => ({
+      slug: s, chunk_index: 0, chunk_text: `t ${s}`, chunk_source: 'compiled_truth' as const, model: null, token_count: 1,
+    }));
 
     let listPagesCalls = 0;
     let getPageCalls = 0;
     const engine = mockEngine({
+      countStaleChunks: async () => 500,
+      listStaleChunks: async () => staleRows,
       listSlugsPendingEmbedding: async () => staleSlugs,
       listPages: async () => { listPagesCalls++; return []; },
       getPage: async () => { getPageCalls++; return null; },
@@ -305,9 +319,16 @@ describe('runEmbedCore --dry-run never calls the embedding model', () => {
         ],
       ]),
     );
+    // SQL-side stale path: 6 stale rows across 3 pages.
+    const stale = pages.flatMap(p => [
+      { slug: p.slug, chunk_index: 0, chunk_text: 'a', chunk_source: 'compiled_truth', model: null, token_count: 1 },
+      { slug: p.slug, chunk_index: 1, chunk_text: 'b', chunk_source: 'compiled_truth', model: null, token_count: 1 },
+    ]);
 
     const upserts: string[] = [];
     const engine = mockEngine({
+      countStaleChunks: async () => 6,
+      listStaleChunks: async () => stale,
       listPages: async () => pages,
       listSlugsPendingEmbedding: async () => pages.map(p => p.slug),
       getPage: async (slug: string) => pages.find(p => p.slug === slug) ?? null,
@@ -325,34 +346,27 @@ describe('runEmbedCore --dry-run never calls the embedding model', () => {
     expect(result.dryRun).toBe(true);
     expect(result.embedded).toBe(0);
     expect(result.would_embed).toBe(6); // 3 pages * 2 chunks each
+    // skipped is 0 in the new SQL-side path: we never considered non-stale chunks.
     expect(result.skipped).toBe(0);
-    expect(result.total_chunks).toBe(6);
+    expect(result.total_chunks).toBe(6); // only stale chunks counted in SQL-side path
     expect(result.pages_processed).toBe(3);
   });
 
-  test('dry-run --stale correctly separates stale from already-embedded', async () => {
+  test('dry-run --stale correctly identifies stale chunks (SQL-side path)', async () => {
     const { runEmbedCore } = await import('../src/commands/embed.ts');
-    const pages = [{ slug: 'fresh' }, { slug: 'partial' }, { slug: 'all-stale' }];
-    const chunksBySlug = new Map<string, any[]>([
-      ['fresh', [
-        { chunk_index: 0, chunk_text: 'a', chunk_source: 'compiled_truth', embedded_at: '2026-01-01', token_count: 1 },
-        { chunk_index: 1, chunk_text: 'b', chunk_source: 'compiled_truth', embedded_at: '2026-01-01', token_count: 1 },
-      ]],
-      ['partial', [
-        { chunk_index: 0, chunk_text: 'a', chunk_source: 'compiled_truth', embedded_at: '2026-01-01', token_count: 1 },
-        { chunk_index: 1, chunk_text: 'b', chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 },
-      ]],
-      ['all-stale', [
-        { chunk_index: 0, chunk_text: 'a', chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 },
-        { chunk_index: 1, chunk_text: 'b', chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 },
-      ]],
-    ]);
+    // SQL-side stale: only the 3 chunks where embedding IS NULL come back,
+    // grouped by slug. 'fresh' page has no stale rows so it's not in the result.
+    const stale = [
+      { slug: 'partial', chunk_index: 1, chunk_text: 'b', chunk_source: 'compiled_truth', model: null, token_count: 1 },
+      { slug: 'all-stale', chunk_index: 0, chunk_text: 'a', chunk_source: 'compiled_truth', model: null, token_count: 1 },
+      { slug: 'all-stale', chunk_index: 1, chunk_text: 'b', chunk_source: 'compiled_truth', model: null, token_count: 1 },
+    ];
 
     const engine = mockEngine({
-      listPages: async () => pages,
+      countStaleChunks: async () => 3,
+      listStaleChunks: async () => stale,
+      // Same slug set as bySlug; no zero-chunk pages in this test.
       listSlugsPendingEmbedding: async () => ['partial', 'all-stale'],
-      getPage: async (slug: string) => pages.find(p => p.slug === slug) ?? null,
-      getChunks: async (slug: string) => chunksBySlug.get(slug) || [],
       upsertChunks: async () => {},
     });
 
@@ -363,9 +377,11 @@ describe('runEmbedCore --dry-run never calls the embedding model', () => {
     // Fast path only iterates stale pages, so counts reflect those:
     // 'partial' (2 chunks: 1 stale + 1 skipped) + 'all-stale' (2 stale)
     expect(result.would_embed).toBe(3); // 1 from 'partial' + 2 from 'all-stale'
-    expect(result.skipped).toBe(1); // the fresh chunk on 'partial'
-    expect(result.total_chunks).toBe(4);
-    expect(result.pages_processed).toBe(2);
+    // SQL-side path does not see non-stale chunks, so skipped=0 and total_chunks=stale-count.
+    // Callers wanting full coverage should call engine.getStats()/getHealth() afterward.
+    expect(result.skipped).toBe(0);
+    expect(result.total_chunks).toBe(3);
+    expect(result.pages_processed).toBe(2); // 'partial' + 'all-stale'
   });
 
   test('dry-run --slugs on a single page counts stale chunks, no API calls', async () => {
@@ -394,7 +410,6 @@ describe('runEmbedCore --dry-run never calls the embedding model', () => {
 
   test('non-dry-run path reports accurate embedded count (regression guard)', async () => {
     const { runEmbedCore } = await import('../src/commands/embed.ts');
-    const pages = [{ slug: 'a' }, { slug: 'b' }];
     const chunksBySlug = new Map<string, any[]>([
       ['a', [{ chunk_index: 0, chunk_text: 'a', chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 }]],
       ['b', [
@@ -402,11 +417,17 @@ describe('runEmbedCore --dry-run never calls the embedding model', () => {
         { chunk_index: 1, chunk_text: 'y', chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 },
       ]],
     ]);
+    const stale = [
+      { slug: 'a', chunk_index: 0, chunk_text: 'a', chunk_source: 'compiled_truth', model: null, token_count: 1 },
+      { slug: 'b', chunk_index: 0, chunk_text: 'x', chunk_source: 'compiled_truth', model: null, token_count: 1 },
+      { slug: 'b', chunk_index: 1, chunk_text: 'y', chunk_source: 'compiled_truth', model: null, token_count: 1 },
+    ];
 
     const engine = mockEngine({
-      listPages: async () => pages,
-      listSlugsPendingEmbedding: async () => pages.map(p => p.slug),
-      getPage: async (slug: string) => pages.find(p => p.slug === slug) ?? null,
+      countStaleChunks: async () => 3,
+      listStaleChunks: async () => stale,
+      // Same slug set as bySlug; no zero-chunk pages in this test.
+      listSlugsPendingEmbedding: async () => ['a', 'b'],
       getChunks: async (slug: string) => chunksBySlug.get(slug) || [],
       upsertChunks: async () => {},
     });
@@ -419,5 +440,189 @@ describe('runEmbedCore --dry-run never calls the embedding model', () => {
     expect(result.embedded).toBe(3); // 1 from a + 2 from b
     expect(result.would_embed).toBe(0);
     expect(result.pages_processed).toBe(2);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────
+// runEmbedCore --stale egress fix: SQL-side staleness filter
+// Replaces the listPages + per-page getChunks bomb with a count +
+// slug-grouped SELECT. On a 100%-embedded brain, 0 listPages calls.
+// ────────────────────────────────────────────────────────────────
+
+describe('runEmbedCore --stale egress fix (SQL-side filter)', () => {
+  test('zero stale chunks: countStaleChunks short-circuits, listPages never called', async () => {
+    const { runEmbedCore } = await import('../src/commands/embed.ts');
+    let listPagesCalled = false;
+    let getChunksCalled = false;
+    let listStaleCalled = false;
+    const engine = mockEngine({
+      countStaleChunks: async () => 0,
+      // Pre-flight runs in parallel with countStaleChunks; both must return
+      // empty for the fast-exit branch.
+      listSlugsPendingEmbedding: async () => [],
+      listPages: async () => { listPagesCalled = true; return []; },
+      getChunks: async () => { getChunksCalled = true; return []; },
+      listStaleChunks: async () => { listStaleCalled = true; return []; },
+      upsertChunks: async () => {},
+    });
+
+    const result = await runEmbedCore(engine, { stale: true });
+
+    expect(result.embedded).toBe(0);
+    expect(result.pages_processed).toBe(0);
+    // The egress fix: NONE of these should have been called when count=0.
+    expect(listPagesCalled).toBe(false);
+    expect(getChunksCalled).toBe(false);
+    expect(listStaleCalled).toBe(false);
+    expect(totalEmbedCalls).toBe(0);
+  });
+
+  test('N stale chunks across M pages: only stale slugs re-fetched, exact stale set embedded, non-stale chunks preserved', async () => {
+    const { runEmbedCore } = await import('../src/commands/embed.ts');
+    let listPagesCalled = false;
+
+    const stale = [
+      { slug: 'page-a', chunk_index: 0, chunk_text: 'x', chunk_source: 'compiled_truth' as const, model: null, token_count: null },
+      { slug: 'page-b', chunk_index: 1, chunk_text: 'y', chunk_source: 'compiled_truth' as const, model: null, token_count: null },
+      { slug: 'page-b', chunk_index: 2, chunk_text: 'z', chunk_source: 'compiled_truth' as const, model: null, token_count: null },
+    ];
+    // page-b has a FRESH chunk at index 0 that must be preserved through the upsert.
+    const fullChunks: Record<string, any[]> = {
+      'page-a': [
+        { chunk_index: 0, chunk_text: 'x', chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 },
+      ],
+      'page-b': [
+        { chunk_index: 0, chunk_text: 'fresh', chunk_source: 'compiled_truth', embedded_at: '2026-01-01', token_count: 5 },
+        { chunk_index: 1, chunk_text: 'y', chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 },
+        { chunk_index: 2, chunk_text: 'z', chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 },
+      ],
+    };
+    const upsertCalls: Array<{ slug: string; chunks: any[] }> = [];
+    const engine = mockEngine({
+      countStaleChunks: async () => 3,
+      listStaleChunks: async () => stale,
+      // Same slug set as bySlug; no zero-chunk pages in this test.
+      listSlugsPendingEmbedding: async () => ['page-a', 'page-b'],
+      listPages: async () => { listPagesCalled = true; return []; },
+      getChunks: async (slug: string) => fullChunks[slug] || [],
+      upsertChunks: async (slug: string, chunks: any[]) => { upsertCalls.push({ slug, chunks }); },
+    });
+
+    const result = await runEmbedCore(engine, { stale: true });
+
+    // listPages must NOT be called in the SQL-side path.
+    expect(listPagesCalled).toBe(false);
+    // One embedBatch call per stale slug (a, b).
+    expect(totalEmbedCalls).toBe(2);
+    expect(result.embedded).toBe(3);
+    expect(result.pages_processed).toBe(2);
+
+    // page-b's upsert MUST include the fresh chunk (chunk_index=0) — otherwise
+    // it would be deleted by the upsertChunks != ALL filter. Critical regression check.
+    const pageBUpsert = upsertCalls.find(u => u.slug === 'page-b');
+    expect(pageBUpsert).toBeDefined();
+    const freshChunkInUpsert = pageBUpsert!.chunks.find((c: any) => c.chunk_index === 0);
+    expect(freshChunkInUpsert).toBeDefined();
+    // Fresh chunk has no `embedding` field (preserved via COALESCE in upsertChunks SQL).
+    expect(freshChunkInUpsert.embedding).toBeUndefined();
+    // Previously-stale chunks come through WITH a new embedding.
+    const staleChunkInUpsert = pageBUpsert!.chunks.find((c: any) => c.chunk_index === 1);
+    expect(staleChunkInUpsert.embedding).toBeDefined();
+    expect(staleChunkInUpsert.embedding).toBeInstanceOf(Float32Array);
+  });
+
+  test('--stale dry-run: counts stale via countStaleChunks, reports via listStaleChunks, no embedBatch or upsertChunks', async () => {
+    const { runEmbedCore } = await import('../src/commands/embed.ts');
+    const stale = [
+      { slug: 'page-a', chunk_index: 0, chunk_text: 'x', chunk_source: 'compiled_truth' as const, model: null, token_count: null },
+      { slug: 'page-b', chunk_index: 0, chunk_text: 'y', chunk_source: 'compiled_truth' as const, model: null, token_count: null },
+    ];
+    const upserts: string[] = [];
+    const engine = mockEngine({
+      countStaleChunks: async () => 2,
+      listStaleChunks: async () => stale,
+      // Same slug set as bySlug; no zero-chunk pages in this test.
+      listSlugsPendingEmbedding: async () => ['page-a', 'page-b'],
+      upsertChunks: async (slug: string) => { upserts.push(slug); },
+    });
+
+    const result = await runEmbedCore(engine, { stale: true, dryRun: true });
+
+    expect(totalEmbedCalls).toBe(0);
+    expect(upserts).toEqual([]);
+    expect(result.would_embed).toBe(2);
+    expect(result.pages_processed).toBe(2);
+    expect(result.dryRun).toBe(true);
+  });
+
+  test('zero-chunk-page-only stale: countStaleChunks=0 but listSlugsPendingEmbedding has new pages, must chunk and embed', async () => {
+    // Closes the gap codex flagged: upstream's `countStaleChunks() === 0` early
+    // return only counts content_chunks rows. Pages created via direct putPage
+    // (migrate-engine, enrichment-service, output/writer) have no rows at all,
+    // so they'd be silently skipped without listSlugsPendingEmbedding's
+    // zero-chunk UNION branch.
+    const { runEmbedCore } = await import('../src/commands/embed.ts');
+    const chunkStore = new Map<string, any[]>();
+    const upserts: Array<{ slug: string; chunkCount: number }> = [];
+    const engine = mockEngine({
+      countStaleChunks: async () => 0, // No stale chunk rows.
+      listStaleChunks: async () => [], // Belt-and-suspenders; should not be called.
+      listSlugsPendingEmbedding: async () => ['new-page'], // Zero-chunk page surfaces here.
+      getPage: async (slug: string) =>
+        slug === 'new-page'
+          ? { slug, compiled_truth: 'Fresh content that needs chunking and embedding.', timeline: '' }
+          : null,
+      getChunks: async (slug: string) => chunkStore.get(slug) ?? [],
+      upsertChunks: async (slug: string, inputs: any[]) => {
+        upserts.push({ slug, chunkCount: inputs.length });
+        chunkStore.set(slug, inputs.map(i => ({
+          chunk_index: i.chunk_index,
+          chunk_text: i.chunk_text,
+          chunk_source: i.chunk_source,
+          embedded_at: null,
+          token_count: 5,
+        })));
+      },
+    });
+
+    const result = await runEmbedCore(engine, { stale: true });
+
+    // The page got chunked (initial upsert) AND embedded (write-back upsert).
+    expect(upserts.length).toBeGreaterThanOrEqual(1);
+    expect(upserts[0].slug).toBe('new-page');
+    expect(upserts[0].chunkCount).toBeGreaterThan(0);
+    expect(totalEmbedCalls).toBeGreaterThan(0);
+    expect(result.embedded).toBeGreaterThan(0);
+    expect(result.pages_processed).toBe(1);
+  });
+
+  test('--all (non-stale) path is byte-identical: walks listPages and embeds every chunk', async () => {
+    // Regression guard for the legacy --all path. Behavior must be byte-identical
+    // to pre-fix: listPages + per-page getChunks + embed every chunk.
+    const { runEmbedCore } = await import('../src/commands/embed.ts');
+    let countStaleCalled = false;
+    let listStaleCalled = false;
+    const pages = [{ slug: 'a' }, { slug: 'b' }];
+    const chunksBySlug = new Map<string, any[]>([
+      ['a', [{ chunk_index: 0, chunk_text: 'a', chunk_source: 'compiled_truth', embedded_at: '2026-01-01', token_count: 1 }]],
+      ['b', [{ chunk_index: 0, chunk_text: 'b', chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 }]],
+    ]);
+
+    const engine = mockEngine({
+      countStaleChunks: async () => { countStaleCalled = true; return 1; },
+      listStaleChunks: async () => { listStaleCalled = true; return []; },
+      listPages: async () => pages,
+      getChunks: async (slug: string) => chunksBySlug.get(slug) || [],
+      upsertChunks: async () => {},
+    });
+
+    const result = await runEmbedCore(engine, { all: true });
+
+    // --all path must NOT take the new short-circuit.
+    expect(countStaleCalled).toBe(false);
+    expect(listStaleCalled).toBe(false);
+    // Both pages get embedded, regardless of embedded_at — that's the --all contract.
+    expect(totalEmbedCalls).toBe(2);
+    expect(result.embedded).toBe(2);
   });
 });

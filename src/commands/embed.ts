@@ -232,35 +232,22 @@ async function embedAll(
   result: EmbedResult,
   onProgress?: (done: number, total: number, embedded: number) => void,
 ) {
-  // Fast path when staleOnly=true: ask the DB which slugs actually need work
-  // BEFORE fetching page rows + doing per-page getChunks probes. On a
-  // fully-embedded brain this returns [] and the phase completes in ms
-  // instead of burning ~15K Supabase round-trips to discover nothing to do.
+  // Stale-only fast path: SQL-side filter avoids the listPages + per-page
+  // getChunks bomb that pulled every page row + every chunk's embedding
+  // column (~76 MB on a 1.5K-page brain) only to client-side-filter for
+  // chunks where embedding IS NULL. embedAllStale also handles zero-chunk
+  // pages (created via direct putPage with no content_chunks rows yet)
+  // via listSlugsPendingEmbedding so the autopilot common case stays
+  // ~50 bytes wire AND new pages still get chunked + embedded.
   //
-  // The primitive includes pages with stale chunks AND pages with no chunk
-  // rows (created via direct putPage), so embedOnePage will handle both.
-  //
-  // embedOnePage only reads page.slug, so we intentionally do NOT hydrate
-  // full page rows here. Hydrating N slugs via N parallel getPage calls
-  // would fan out ahead of the GBRAIN_EMBED_CONCURRENCY throttle and
-  // regress the large-stale-brain case this fix is meant to help. Pages
-  // that turn out to need chunking (zero-chunk case) have their getPage
-  // deferred to embedOnePage, which runs inside the throttled worker pool.
-  let pages: Array<{ slug: string }>;
+  // For --all (staleOnly=false) we keep the original behavior - the
+  // user is explicitly asking to re-embed everything, including chunks
+  // that already have embeddings.
   if (staleOnly) {
-    const pendingSlugs = await engine.listSlugsPendingEmbedding();
-    if (pendingSlugs.length === 0) {
-      if (dryRun) {
-        console.log(`[dry-run] Would embed 0 chunks across 0 pages (nothing pending)`);
-      } else {
-        console.log(`Embedded 0 chunks across 0 pages (nothing pending)`);
-      }
-      return;
-    }
-    pages = pendingSlugs.map(slug => ({ slug }));
-  } else {
-    pages = await engine.listPages({ limit: 100000 });
+    return await embedAllStale(engine, dryRun, result, onProgress);
   }
+
+  const pages = await engine.listPages({ limit: 100000 });
   let processed = 0;
 
   // Concurrency limit for parallel page embedding.
@@ -274,63 +261,8 @@ async function embedAll(
   const CONCURRENCY = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '20', 10);
 
   async function embedOnePage(page: typeof pages[number]) {
-    let chunks = await engine.getChunks(page.slug);
-
-    // Zero-chunk page path: pages created via direct putPage() (migrate-engine,
-    // enrichment-service, output/writer) have no content_chunks rows yet. Build
-    // initial chunks from compiled_truth + timeline so embed --stale and
-    // autopilot actually embed them instead of leaving them stranded. This runs
-    // inside the worker pool, so it stays throttled by GBRAIN_EMBED_CONCURRENCY.
-    //
-    // Wrapped in try/catch so one failed bootstrap (getPage / upsertChunks
-    // transient error) logs and moves on instead of aborting the whole
-    // worker pool via Promise.all rejection. Matches the error-handling
-    // semantics of the main embed path below.
-    if (chunks.length === 0) {
-      try {
-        const full = await engine.getPage(page.slug);
-        if (!full) {
-          // Page was deleted between listing and processing; skip silently.
-          processed++;
-          result.pages_processed++;
-          onProgress?.(processed, pages.length, result.embedded);
-          return;
-        }
-        const inputs = buildInitialChunkInputs(full);
-
-        if (dryRun) {
-          result.total_chunks += inputs.length;
-          result.would_embed += inputs.length;
-          processed++;
-          result.pages_processed++;
-          onProgress?.(processed, pages.length, result.embedded);
-          return;
-        }
-
-        if (inputs.length > 0) {
-          await engine.upsertChunks(page.slug, inputs);
-          chunks = await engine.getChunks(page.slug);
-        } else {
-          // Page has no text to chunk (empty compiled_truth + timeline). The
-          // pending-primitive normally filters these out, but we defend in
-          // depth in case of a race or a caller bypassing the primitive.
-          processed++;
-          result.pages_processed++;
-          onProgress?.(processed, pages.length, result.embedded);
-          return;
-        }
-      } catch (e: unknown) {
-        console.error(`\n  Error bootstrapping chunks for ${page.slug}: ${e instanceof Error ? e.message : e}`);
-        processed++;
-        result.pages_processed++;
-        onProgress?.(processed, pages.length, result.embedded);
-        return;
-      }
-    }
-
-    const toEmbed = staleOnly
-      ? chunks.filter(c => !c.embedded_at)
-      : chunks;
+    const chunks = await engine.getChunks(page.slug);
+    const toEmbed = chunks; // staleOnly path handled above via embedAllStale
 
     result.total_chunks += chunks.length;
     result.skipped += chunks.length - toEmbed.length;
@@ -398,4 +330,193 @@ async function embedAll(
   } else {
     console.log(`Embedded ${result.embedded} chunks across ${pages.length} pages`);
   }
+}
+
+/**
+ * SQL-side stale path: replaces the listPages + per-page getChunks walk
+ * with a count + slug-grouped SELECT for the common case (existing chunks
+ * with NULL embeddings) AND a UNION-side enumeration of zero-chunk pages
+ * for the bootstrap case (pages created via direct putPage that have no
+ * content_chunks rows yet).
+ *
+ * Why a separate function: the staleOnly path doesn't need listPages and
+ * groups by slug differently. Forking the function makes the read-bytes
+ * path explicit and keeps the --all path verbatim from prior behavior.
+ *
+ * Staleness predicate: `embedding IS NULL`. We deliberately do NOT use
+ * `embedded_at IS NULL` here - the bulk-import path can leave embedded_at
+ * populated while embedding is NULL (see upsertChunks consistency notes),
+ * and `embedding IS NULL` is the truth source for "this chunk needs an
+ * embedding". The same predicate is used by listSlugsPendingEmbedding.
+ *
+ * Zero-chunk awareness: countStaleChunks/listStaleChunks only see
+ * content_chunks rows. Pages with no chunk rows would be silently skipped
+ * without listSlugsPendingEmbedding's UNION branch that surfaces them.
+ * This matters for migrate-engine, enrichment-service, and output/writer
+ * paths that putPage without chunking.
+ */
+async function embedAllStale(
+  engine: BrainEngine,
+  dryRun: boolean,
+  result: EmbedResult,
+  onProgress?: (done: number, total: number, embedded: number) => void,
+) {
+  // Two-signal pre-flight: stale chunks (existing rows with NULL embedding)
+  // AND pending slugs (the UNION superset that also covers zero-chunk pages).
+  // Run in parallel to keep the autopilot common case (both empty) cheap.
+  const [staleCount, pendingSlugs] = await Promise.all([
+    engine.countStaleChunks(),
+    engine.listSlugsPendingEmbedding(),
+  ]);
+
+  if (staleCount === 0 && pendingSlugs.length === 0) {
+    if (dryRun) {
+      console.log('[dry-run] Would embed 0 chunks (nothing pending)');
+    } else {
+      console.log('Embedded 0 chunks (nothing pending)');
+    }
+    return;
+  }
+
+  // Pull stale chunks only when the count says they exist (no embedding column
+  // shipped over the wire).
+  const staleRows = staleCount > 0 ? await engine.listStaleChunks() : [];
+  const bySlug = new Map<string, typeof staleRows>();
+  for (const row of staleRows) {
+    const list = bySlug.get(row.slug);
+    if (list) list.push(row);
+    else bySlug.set(row.slug, [row]);
+  }
+
+  // Master slug list = pendingSlugs ∪ bySlug.keys(). After the
+  // listSlugsPendingEmbedding predicate fix (embedding IS NULL) the two
+  // agree at the slug grain, but unioning is belt-and-suspenders for any
+  // future divergence and a single bug-class barrier.
+  const slugSet = new Set<string>();
+  for (const slug of pendingSlugs) slugSet.add(slug);
+  for (const slug of bySlug.keys()) slugSet.add(slug);
+  const slugs = Array.from(slugSet);
+
+  const totalStaleChunks = staleRows.length;
+  result.total_chunks += totalStaleChunks;
+  // skipped is "chunks we considered and skipped due to having an embedding".
+  // We never considered the non-stale chunks here, so leave skipped at 0.
+  // Callers reading EmbedResult who care about coverage should call
+  // engine.getStats() / engine.getHealth() afterward.
+
+  if (dryRun) {
+    // Count what zero-chunk pages WOULD produce so the dry-run estimate is
+    // honest about bootstrap work, not just the stale-rows subset.
+    let zeroChunkWouldEmbed = 0;
+    for (const slug of slugs) {
+      if (bySlug.has(slug)) continue;
+      try {
+        const full = await engine.getPage(slug);
+        if (!full) continue;
+        zeroChunkWouldEmbed += buildInitialChunkInputs(full).length;
+      } catch {
+        // Best-effort in dry-run: skip pages we can't read instead of failing
+        // the whole preview.
+      }
+    }
+    result.total_chunks += zeroChunkWouldEmbed;
+    result.would_embed += totalStaleChunks + zeroChunkWouldEmbed;
+    result.pages_processed += slugs.length;
+    if (onProgress) {
+      // Emit a single tick to satisfy the contract (CLI progress reporters
+      // expect at least one start/finish pair).
+      onProgress(slugs.length, slugs.length, 0);
+    }
+    console.log(`[dry-run] Would embed ${totalStaleChunks + zeroChunkWouldEmbed} chunks across ${slugs.length} pages`);
+    return;
+  }
+
+  const CONCURRENCY = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '20', 10);
+  let processed = 0;
+
+  async function embedOneSlug(slug: string) {
+    const stale = bySlug.get(slug);
+    try {
+      if (!stale) {
+        // Zero-chunk path: page has no content_chunks rows yet (created via
+        // direct putPage by migrate-engine, enrichment-service, output/writer).
+        // Bootstrap chunks from compiled_truth + timeline, then embed them.
+        const full = await engine.getPage(slug);
+        if (!full) {
+          // Page deleted between listing and processing; skip silently.
+          processed++;
+          result.pages_processed++;
+          onProgress?.(processed, slugs.length, result.embedded);
+          return;
+        }
+        const inputs = buildInitialChunkInputs(full);
+        if (inputs.length === 0) {
+          // listSlugsPendingEmbedding excludes empty pages, but defend in
+          // depth in case of a race or a caller bypassing the primitive.
+          processed++;
+          result.pages_processed++;
+          onProgress?.(processed, slugs.length, result.embedded);
+          return;
+        }
+        await engine.upsertChunks(slug, inputs);
+        const fresh = await engine.getChunks(slug);
+        const embeddings = await embedBatch(fresh.map(c => c.chunk_text));
+        const embeddingMap = new Map<number, Float32Array>();
+        for (let j = 0; j < fresh.length; j++) {
+          embeddingMap.set(fresh[j].chunk_index, embeddings[j]);
+        }
+        const updated: ChunkInput[] = fresh.map(c => ({
+          chunk_index: c.chunk_index,
+          chunk_text: c.chunk_text,
+          chunk_source: c.chunk_source,
+          embedding: embeddingMap.get(c.chunk_index),
+          token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
+        }));
+        await engine.upsertChunks(slug, updated);
+        result.total_chunks += fresh.length;
+        result.embedded += fresh.length;
+      } else {
+        // Stale-rows path: upstream's merge-preserve.
+        const embeddings = await embedBatch(stale.map(c => c.chunk_text));
+        // CRITICAL: passing ONLY the stale indices to upsertChunks would
+        // delete every non-stale chunk on the same page (the != ALL filter
+        // wipes any chunk_index NOT in the input). Re-fetch + merge to
+        // preserve existing embeddings.
+        const existing = await engine.getChunks(slug);
+        const staleIdxToEmbedding = new Map<number, Float32Array>();
+        for (let j = 0; j < stale.length; j++) {
+          staleIdxToEmbedding.set(stale[j].chunk_index, embeddings[j]);
+        }
+        const merged: ChunkInput[] = existing.map(c => ({
+          chunk_index: c.chunk_index,
+          chunk_text: c.chunk_text,
+          chunk_source: c.chunk_source,
+          // For stale chunks: pass the new embedding.
+          // For non-stale chunks: undefined -> COALESCE preserves existing.
+          embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
+          token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
+        }));
+        await engine.upsertChunks(slug, merged);
+        result.embedded += stale.length;
+      }
+    } catch (e: unknown) {
+      console.error(`\n  Error embedding ${slug}: ${e instanceof Error ? e.message : e}`);
+    }
+    processed++;
+    result.pages_processed++;
+    onProgress?.(processed, slugs.length, result.embedded);
+  }
+
+  let nextIdx = 0;
+  async function worker() {
+    while (nextIdx < slugs.length) {
+      const idx = nextIdx++;
+      await embedOneSlug(slugs[idx]);
+    }
+  }
+
+  const numWorkers = Math.min(CONCURRENCY, slugs.length);
+  await Promise.all(Array.from({ length: numWorkers }, () => worker()));
+
+  console.log(`Embedded ${result.embedded} chunks across ${slugs.length} pages`);
 }
