@@ -16,13 +16,14 @@
 export const PGLITE_SCHEMA_SQL = `
 -- GBrain PGLite schema (local embedded Postgres)
 
--- v0.22.9.0: PGLite intentionally keeps vector + pg_trgm in `public`.
--- Postgres canonical (src/schema.sql) installs them in `extensions` to close
--- Supabase advisor lint 0014. PGLite users never see that lint, PGLite is
--- single-tenant single-process so namespace placement has zero operational
--- impact, and WASM-loaded extension relocation under ALTER EXTENSION SET
--- SCHEMA is unverified. Migration v36 reflects this asymmetry via sqlFor
--- (Postgres relocates, PGLite no-ops). Do not homogenize.
+-- v0.22.9.0: PGLite intentionally keeps vector + pg_trgm in public.
+-- Postgres canonical (src/schema.sql) installs them in the extensions
+-- schema to close Supabase advisor lint 0014. PGLite users never see that
+-- lint, PGLite is single-tenant single-process so namespace placement has
+-- zero operational impact, and WASM-loaded extension relocation under
+-- ALTER EXTENSION SET SCHEMA is unverified. Migration v36 reflects this
+-- asymmetry via sqlFor (Postgres relocates, PGLite no-ops). Do not
+-- homogenize.
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
