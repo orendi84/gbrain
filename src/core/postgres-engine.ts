@@ -158,6 +158,27 @@ export class PostgresEngine implements BrainEngine {
   private async applyForwardReferenceBootstrap(): Promise<void> {
     const conn = this.sql;
 
+    // v0.22.9.0: relocate vector + pg_trgm out of public BEFORE SCHEMA_SQL
+    // replays. Required because SCHEMA_SQL now references extensions.vector,
+    // extensions.gin_trgm_ops, and extensions.vector_cosine_ops; on a brain
+    // where the extensions still live in public, those identifiers fail to
+    // resolve and CREATE TABLE / CREATE INDEX statements crash before the
+    // v36 migration ever gets a chance to run. Idempotent: no-op once the
+    // extensions are in `extensions`.
+    const extInPublic = await conn<{ extname: string }[]>`
+      SELECT e.extname
+      FROM pg_extension e
+      JOIN pg_namespace n ON e.extnamespace = n.oid
+      WHERE n.nspname = 'public' AND e.extname IN ('vector', 'pg_trgm')
+    `;
+    if (extInPublic.length > 0) {
+      console.log(`  Relocating ${extInPublic.length} extension(s) out of public schema`);
+      await conn.unsafe('CREATE SCHEMA IF NOT EXISTS extensions');
+      for (const { extname } of extInPublic) {
+        await conn.unsafe(`ALTER EXTENSION ${extname} SET SCHEMA extensions`);
+      }
+    }
+
     // Single round-trip probe for every forward-reference target.
     // current_schema() resolves to whatever search_path the connection uses,
     // which matches schema-embedded.ts's `public.` references.
@@ -405,11 +426,13 @@ export class PostgresEngine implements BrainEngine {
     const exact = await sql`SELECT slug FROM pages WHERE slug = ${partial}`;
     if (exact.length > 0) return [exact[0].slug];
 
-    // Fuzzy match via pg_trgm
+    // Fuzzy match via pg_trgm. Operator + function are schema-qualified so
+    // resolution does not depend on connection-level search_path (v0.22.9.0,
+    // pg_trgm lives in `extensions` schema after migration v36).
     const fuzzy = await sql`
-      SELECT slug, similarity(title, ${partial}) AS sim
+      SELECT slug, extensions.similarity(title, ${partial}) AS sim
       FROM pages
-      WHERE title % ${partial} OR slug ILIKE ${'%' + partial + '%'}
+      WHERE title OPERATOR(extensions.%) ${partial} OR slug ILIKE ${'%' + partial + '%'}
       ORDER BY sim DESC
       LIMIT 5
     `;
@@ -665,12 +688,15 @@ export class PostgresEngine implements BrainEngine {
     params.push(offset);
     const offsetParam = `$${params.length}`;
 
+    // v0.22.9.0: vector type + <=> operator are schema-qualified so the HNSW
+    // search resolves correctly regardless of connection search_path.
+    // pgvector lives in `extensions` schema after migration v36.
     const rawQuery = `
       WITH hnsw_candidates AS (
         SELECT
           p.slug, p.id as page_id, p.title, p.type, p.source_id,
           cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-          1 - (cc.embedding <=> $1::vector) AS raw_score
+          1 - (cc.embedding OPERATOR(extensions.<=>) $1::extensions.vector) AS raw_score
         FROM content_chunks cc
         JOIN pages p ON p.id = cc.page_id
         WHERE cc.embedding IS NOT NULL
@@ -680,7 +706,7 @@ export class PostgresEngine implements BrainEngine {
           ${languageClause}
           ${symbolKindClause}
           ${hardExcludeClause}
-        ORDER BY cc.embedding <=> $1::vector
+        ORDER BY cc.embedding OPERATOR(extensions.<=>) $1::extensions.vector
         LIMIT ${innerLimitParam}
       )
       SELECT
@@ -755,7 +781,8 @@ export class PostgresEngine implements BrainEngine {
         : null;
 
       if (embeddingStr) {
-        rows.push(`($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::vector, $${paramIdx++}, $${paramIdx++}, now(), $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::text[], $${paramIdx++}, $${paramIdx++})`);
+        // v0.22.9.0: vector type schema-qualified (lives in `extensions`).
+        rows.push(`($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::extensions.vector, $${paramIdx++}, $${paramIdx++}, now(), $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::text[], $${paramIdx++}, $${paramIdx++})`);
         params.push(
           pageId, chunk.chunk_index, chunk.chunk_text, chunk.chunk_source,
           embeddingStr, chunk.model || 'text-embedding-3-large', chunk.token_count || null,
@@ -1049,10 +1076,11 @@ export class PostgresEngine implements BrainEngine {
     // same winner when multiple pages score equally (prevents churn
     // in put_page auto-link reconciliation).
     const prefixPattern = dirPrefix ? `${dirPrefix}/%` : '%';
+    // v0.22.9.0: similarity() schema-qualified (pg_trgm in `extensions`).
     const rows = await sql`
-      SELECT slug, similarity(title, ${name}) AS sim
+      SELECT slug, extensions.similarity(title, ${name}) AS sim
       FROM pages
-      WHERE similarity(title, ${name}) >= ${minSimilarity}
+      WHERE extensions.similarity(title, ${name}) >= ${minSimilarity}
         AND slug LIKE ${prefixPattern}
       ORDER BY sim DESC, slug ASC
       LIMIT 1

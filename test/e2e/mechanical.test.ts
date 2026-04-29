@@ -593,9 +593,10 @@ describeE2E('E2E: Chunks & Resolution', () => {
     // embedded_at populated while embedding is NULL, so embedding is the
     // truth source for "this chunk needs an embedding". Stamp BOTH columns
     // to mirror what upsertChunks() does after a successful embed.
+    // v0.22.9.0: vector type schema-qualified (lives in `extensions`).
     await conn.unsafe(`
       UPDATE content_chunks
-         SET embedding = ('[' || array_to_string(array_fill(0::real, ARRAY[1536]), ',') || ']')::vector,
+         SET embedding = ('[' || array_to_string(array_fill(0::real, ARRAY[1536]), ',') || ']')::extensions.vector,
              embedded_at = now()
        WHERE page_id = (SELECT id FROM pages WHERE slug = 'people/sarah-chen')
     `);
@@ -990,16 +991,25 @@ describeE2E('E2E: Schema Diff Guard', () => {
     }
   });
 
-  test('pgvector extension is installed', async () => {
+  test('pgvector extension is installed in extensions schema', async () => {
     const conn = getConn();
-    const ext = await conn.unsafe(`SELECT extname FROM pg_extension WHERE extname = 'vector'`);
+    const ext = await conn.unsafe(`
+      SELECT extname, extnamespace::regnamespace::text AS schema
+      FROM pg_extension WHERE extname = 'vector'
+    `);
     expect(ext.length).toBe(1);
+    // v0.22.9.0: closes Supabase advisor lint 0014 (extension_in_public).
+    expect((ext[0] as any).schema).toBe('extensions');
   });
 
-  test('pg_trgm extension is installed', async () => {
+  test('pg_trgm extension is installed in extensions schema', async () => {
     const conn = getConn();
-    const ext = await conn.unsafe(`SELECT extname FROM pg_extension WHERE extname = 'pg_trgm'`);
+    const ext = await conn.unsafe(`
+      SELECT extname, extnamespace::regnamespace::text AS schema
+      FROM pg_extension WHERE extname = 'pg_trgm'
+    `);
     expect(ext.length).toBe(1);
+    expect((ext[0] as any).schema).toBe('extensions');
   });
 });
 

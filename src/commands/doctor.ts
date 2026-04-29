@@ -316,18 +316,43 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     return;
   }
 
-  // 4. pgvector extension
-  progress.heartbeat('pgvector');
+  // 4. Extension placement (vector + pg_trgm). v0.22.9.0: both must live in
+  // the `extensions` schema, not public. Closes Supabase advisor lint 0014.
+  progress.heartbeat('extensions');
   try {
     const sql = db.getConnection();
-    const ext = await sql`SELECT extname FROM pg_extension WHERE extname = 'vector'`;
-    if (ext.length > 0) {
-      checks.push({ name: 'pgvector', status: 'ok', message: 'Extension installed' });
-    } else {
-      checks.push({ name: 'pgvector', status: 'fail', message: 'Extension not found. Run: CREATE EXTENSION vector;' });
+    const exts = await sql`
+      SELECT extname, extnamespace::regnamespace::text AS schema
+      FROM pg_extension WHERE extname IN ('vector', 'pg_trgm')
+    `;
+    const byName: Record<string, string> = Object.fromEntries(
+      exts.map((e: any) => [e.extname, e.schema]),
+    );
+    for (const name of ['vector', 'pg_trgm'] as const) {
+      const checkName = name === 'vector' ? 'pgvector' : 'pg_trgm';
+      const schema = byName[name];
+      if (!schema) {
+        checks.push({
+          name: checkName,
+          status: 'fail',
+          message: `Extension not found. Run: CREATE SCHEMA IF NOT EXISTS extensions; CREATE EXTENSION ${name} WITH SCHEMA extensions;`,
+        });
+      } else if (schema !== 'extensions') {
+        checks.push({
+          name: checkName,
+          status: 'warn',
+          message: `Extension installed in schema "${schema}" instead of "extensions". Apply migration v36: gbrain init --migrate-only.`,
+        });
+      } else {
+        checks.push({
+          name: checkName,
+          status: 'ok',
+          message: 'Extension installed in extensions schema',
+        });
+      }
     }
   } catch {
-    checks.push({ name: 'pgvector', status: 'warn', message: 'Could not check pgvector extension' });
+    checks.push({ name: 'extensions', status: 'warn', message: 'Could not check extension placement' });
   }
 
   // 4b. PgBouncer / prepared-statement compatibility.

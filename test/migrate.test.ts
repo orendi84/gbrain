@@ -994,11 +994,12 @@ describe('v30/v31/v32 — embed-worker index backfills', () => {
 
   test('LATEST_VERSION reflects the latest migration entry', () => {
     // Bumped 32 -> 34 in v0.22.8.0 (has_chunkable_text + partial index),
-    // 34 -> 35 with trigger_function_search_path_hardening. Future
-    // maintainers: this assertion guards against accidentally shipping a
-    // migration that doesn't bump LATEST_VERSION; update it when the
-    // highest-versioned migration changes.
-    expect(LATEST_VERSION).toBe(35);
+    // 34 -> 35 with trigger_function_search_path_hardening,
+    // 35 -> 36 with move_extensions_out_of_public. Future maintainers:
+    // this assertion guards against accidentally shipping a migration that
+    // doesn't bump LATEST_VERSION; update it when the highest-versioned
+    // migration changes.
+    expect(LATEST_VERSION).toBe(36);
   });
 });
 
@@ -1140,5 +1141,36 @@ describe('v35 — trigger function search_path hardening', () => {
     expect(pl).toMatch(/CREATE OR REPLACE FUNCTION public\.update_page_search_vector\(\)/);
     expect(pl).toMatch(/SET search_path = ''/);
     expect(pl).toContain('FROM public.timeline_entries');
+  });
+});
+
+describe('v36 — move_extensions_out_of_public', () => {
+  const v36 = MIGRATIONS.find(m => m.version === 36);
+
+  test('exists with expected name + sqlFor pattern (no handler, default transaction)', () => {
+    expect(v36).toBeDefined();
+    expect(v36!.name).toBe('move_extensions_out_of_public');
+    // sqlFor + sql:'' fallback shape (matches v24 / v25 / v35). Not a handler
+    // migration: ALTER EXTENSION ... SET SCHEMA is metadata-only and composes
+    // inside the runner's default transaction wrapper.
+    expect(v36!.sql).toBe('');
+    expect(v36!.sqlFor).toBeDefined();
+    expect(v36!.handler).toBeUndefined();
+    expect(v36!.transaction).not.toBe(false);
+  });
+
+  test('Postgres branch creates extensions schema and relocates both extensions', () => {
+    const pg = v36!.sqlFor!.postgres!;
+    expect(pg).toMatch(/CREATE SCHEMA IF NOT EXISTS extensions/);
+    expect(pg).toMatch(/ALTER EXTENSION vector SET SCHEMA extensions/);
+    expect(pg).toMatch(/ALTER EXTENSION pg_trgm SET SCHEMA extensions/);
+  });
+
+  test('PGLite branch is intentional no-op (extensions stay in public on PGLite)', () => {
+    // PGLite WASM extension relocation under ALTER EXTENSION SET SCHEMA is
+    // unverified, and PGLite users never see Supabase advisor lint 0014.
+    // The empty branch documents the divergence.
+    const pl = v36!.sqlFor!.pglite!;
+    expect(pl).toBe('');
   });
 });

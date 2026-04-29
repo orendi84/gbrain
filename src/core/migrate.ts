@@ -1321,6 +1321,38 @@ export const MIGRATIONS: Migration[] = [
       `,
     },
   },
+  {
+    version: 36,
+    name: 'move_extensions_out_of_public',
+    // Closes Supabase advisor lint 0014 (extension_in_public). vector and
+    // pg_trgm move from public to a dedicated extensions schema.
+    // ALTER EXTENSION ... SET SCHEMA is catalog-only: no row rewrite,
+    // no HNSW rebuild, no index invalidation. Existing columns and
+    // indexes keep their bindings via internal OIDs.
+    //
+    // On any brain that bootstraps via initSchema(), the relocation has
+    // already happened via applyForwardReferenceBootstrap() before this
+    // migration runs. v36 still ships as a forensic record so the migration
+    // ledger reflects what changed; the ALTER calls are idempotent and
+    // produce no observable effect on already-relocated brains.
+    //
+    // PGLite branch is intentionally a no-op:
+    //  - Supabase advisor only flags Supabase brains; PGLite users never
+    //    see lint 0014.
+    //  - PGLite is single-tenant single-process; namespace placement has
+    //    zero operational impact there.
+    //  - WASM-loaded extension relocation under ALTER EXTENSION SET SCHEMA
+    //    is unverified.
+    sql: '',
+    sqlFor: {
+      postgres: `
+        CREATE SCHEMA IF NOT EXISTS extensions;
+        ALTER EXTENSION vector SET SCHEMA extensions;
+        ALTER EXTENSION pg_trgm SET SCHEMA extensions;
+      `,
+      pglite: '',
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
