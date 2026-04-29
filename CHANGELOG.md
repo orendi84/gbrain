@@ -2,6 +2,137 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.22.9.0] - 2026-04-29
+
+**pgvector and pg_trgm move out of public so Supabase advisor lint 0014 stops nagging.**
+**Postgres-only relocation. PGLite stays in public on purpose.**
+
+GBrain's two extensions (pgvector for embeddings + HNSW search, pg_trgm for
+fuzzy slug matching) lived in the `public` schema, which Supabase's advisor
+flags as `extension_in_public`. The fix is structural: relocate both to a
+dedicated `extensions` schema and schema-qualify every reference in the
+canonical Postgres source so resolution does not depend on connection-level
+`search_path`. The migration is metadata-only on the live database, no row
+rewrite, no HNSW rebuild, no embedded data movement.
+
+The bootstrap probe in `PostgresEngine.initSchema` runs the relocation
+BEFORE replaying SCHEMA_SQL so existing brains do not crash on the new
+`extensions.vector(1536)` references during upgrade. Migration v36 is the
+forensic record in the migration ledger; the actual relocation may have
+already happened during bootstrap. Both paths land at the same final state.
+
+PGLite intentionally keeps both extensions in `public`. PGLite users never
+see the Supabase advisor, the engine is single-tenant single-process so
+namespace placement has zero operational impact, and WASM-loaded extension
+relocation under `ALTER EXTENSION SET SCHEMA` is unverified. Migration v36
+sqlFor splits Postgres (relocates) from PGLite (no-op).
+
+### The numbers that matter
+
+Measured on the production Supabase brain via the advisor API:
+
+| Metric | Before | After | Δ |
+|---|---|---|---|
+| `extension_in_public` lints | 2 | 0 | -2 |
+| `function_search_path_mutable` lints (v0.22.8.0 baseline) | 0 | 0 | 0 |
+| HNSW index rows requiring rebuild | 0 (catalog-only ALTER) | 0 | 0 |
+| Connection search_path dependency for pgvector ops | yes | no (schema-qualified) | resolved |
+
+Combined with v0.22.8.0's trigger function hardening, this closes the last
+two security advisories that were not intentional service-role patterns.
+The 27 remaining `rls_enabled_no_policy` INFO findings are by design.
+
+### What this means for brain operators
+
+Run `gbrain upgrade` and the next schema-touching CLI invocation (e.g.
+`gbrain init --migrate-only` or any cycle that calls `engine.initSchema()`)
+applies the relocation automatically. Brains where the extensions were
+manually moved earlier see the migration as a no-op. `gbrain doctor --fast`
+gains a check that warns if either extension is still in public, so you
+can spot drift even if the migration ledger is unclear.
+
+### Itemized changes
+
+#### Added
+
+- Migration v36 `move_extensions_out_of_public` in `src/core/migrate.ts`.
+  sqlFor split: Postgres branch creates the `extensions` schema and runs
+  `ALTER EXTENSION ... SET SCHEMA extensions` for both `vector` and
+  `pg_trgm`; PGLite branch is empty (intentional, see above).
+- `applyForwardReferenceBootstrap` in `src/core/postgres-engine.ts` gains
+  an extension probe at the top of the function: if either extension is
+  still in `public` on a brain that hits initSchema, the relocation runs
+  before SCHEMA_SQL replays. Idempotent. Closes the bootstrap-order class
+  of bug that has bitten gbrain on every release that added forward-
+  qualified type references (10+ recurrences across 6 schema versions).
+- `gbrain doctor` now reports schema placement for both `vector` and
+  `pg_trgm`. WARN if either is still in public, OK once both are in
+  extensions.
+
+#### Changed
+
+- `src/schema.sql` and `src/core/schema-embedded.ts` (regenerated): the
+  `CREATE EXTENSION` block creates `extensions` schema first and installs
+  both extensions there via `WITH SCHEMA extensions`. All references
+  schema-qualified: `embedding extensions.vector(1536)`,
+  `extensions.gin_trgm_ops`, `extensions.vector_cosine_ops`.
+- `src/core/postgres-engine.ts`: every pgvector and pg_trgm operator,
+  function, and type cast is schema-qualified. The HNSW search uses
+  `OPERATOR(extensions.<=>) $1::extensions.vector` instead of the bare
+  `<=>` form. Fuzzy slug match uses `OPERATOR(extensions.%)` and
+  `extensions.similarity(...)`. `upsertChunks` casts via
+  `$N::extensions.vector`. Resolution no longer depends on the connection
+  role's `search_path` setting.
+- `src/commands/init.ts`: pgvector creation uses
+  `CREATE EXTENSION ... WITH SCHEMA extensions`.
+- `src/core/pglite-schema.ts`: comment-only change documenting the
+  intentional divergence from `src/schema.sql`. PGLite still installs both
+  extensions in `public` because `ALTER EXTENSION SET SCHEMA` behavior on
+  PGLite's WASM-loaded extensions is unverified.
+
+#### Tests
+
+- `test/migrate.test.ts`: `LATEST_VERSION` guard bumped 35 to 36, three
+  structural assertions on v36's sqlFor shape (Postgres branch creates
+  schema and ALTERs both extensions, PGLite branch is empty).
+- `test/e2e/mechanical.test.ts`: `::vector` cast in the
+  `listSlugsPendingEmbedding` test fixture updated to
+  `::extensions.vector`. Extension presence assertions verify
+  `extnamespace::regnamespace::text = 'extensions'` for both extensions.
+
+## To take advantage of v0.22.9.0
+
+`gbrain upgrade` does this automatically. If it didn't, or if `gbrain doctor`
+warns about either extension still being in public:
+
+1. **Run the migration manually:**
+   ```bash
+   gbrain init --migrate-only
+   ```
+   (the standard `apply-migrations` runner only runs orchestrator
+   migrations; schema migrations like v36 run via `connectEngine()` /
+   `initSchema()` which `init --migrate-only` triggers).
+
+2. **Verify both extensions moved:**
+   ```bash
+   gbrain doctor --fast
+   ```
+   The `pgvector` and `pg_trgm` checks should both report
+   "Extension installed in extensions schema."
+
+3. **(Supabase users) confirm the advisor is clean:**
+   Open the Supabase dashboard, advisor, security tab. The
+   `extension_in_public` finding count should drop to 0.
+
+4. **If any step fails or numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+   This feedback loop is how the gbrain maintainers find fragile upgrade
+   paths. Thank you.
+
 ## [0.22.8.1] - 2026-04-29
 
 **`bun run test:e2e` no longer wedges your autopilot.**
