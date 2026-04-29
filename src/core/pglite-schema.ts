@@ -73,6 +73,9 @@ CREATE INDEX IF NOT EXISTS idx_pages_source_id ON pages(source_id);
 -- and every getPage/upsertChunks/deleteChunks call site that walks pages by
 -- slug. Postgres parity via migration v32.
 CREATE INDEX IF NOT EXISTS idx_pages_slug ON pages(slug);
+-- v0.22.8.0: pre-ALTER fix for stale-brain schema bootstrap. See
+-- src/schema.sql for the rationale (4th recurrence of the same footgun).
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS has_chunkable_text BOOLEAN NOT NULL DEFAULT false;
 -- v0.22.8.0: covering partial index for listSlugsPendingEmbedding's UNION
 -- branch 2. id for the anti-join, slug for the projection. Postgres
 -- parity via migration v34.

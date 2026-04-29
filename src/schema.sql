@@ -91,6 +91,14 @@ CREATE INDEX IF NOT EXISTS idx_pages_source_id ON pages(source_id);
 -- slug. Without this, those queries fall back to scanning all rows. Backfilled
 -- to live brains via migration v32.
 CREATE INDEX IF NOT EXISTS idx_pages_slug ON pages(slug);
+-- v0.22.8.0: pre-ALTER fix for the recurring schema-bootstrap-on-future-columns
+-- footgun (4th recurrence: see v0.13, v0.16, v0.27 history). On fresh installs
+-- the CREATE TABLE above already creates has_chunkable_text. On stale brains
+-- whose pages table predates v0.22.8.0, CREATE TABLE IF NOT EXISTS is a no-op
+-- and the column would otherwise be missing when the partial index below tries
+-- to reference it during initSchema. ADD COLUMN IF NOT EXISTS bridges the gap
+-- so the partial index can land before migration v33 has a chance to run.
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS has_chunkable_text BOOLEAN NOT NULL DEFAULT false;
 -- v0.22.8.0: covering partial index for listSlugsPendingEmbedding's UNION
 -- branch 2. id for the anti-join, slug for the projection. Backfilled to
 -- live brains via migration v34.
