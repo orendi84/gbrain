@@ -2,6 +2,34 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.22.9.1] - 2026-04-29
+
+**Fork picks up upstream's doctor batch-load and MCP HTTP bearer-auth.**
+**The fork's own .0/.1 patch train and upstream's mainline are now reconciled.**
+
+Two upstream features that the fork was missing:
+
+- **Doctor integrity batch-load** (upstream v0.22.8, garrytan/gbrain#393): `gbrain doctor` integrity check now batch-loads all sample pages in a single SQL query instead of 500 sequential `getPage()` calls. On Supabase / PgBouncer transaction-mode pooling this fixes the 60s+ doctor timeout. Multi-source brains: `SELECT DISTINCT ON (slug)` mirrors the sequential path's per-slug semantics so counts are exact instead of inflated.
+- **MCP HTTP transport with bearer auth** (upstream v0.22.7, garrytan/gbrain#483): built-in HTTP transport for remote MCP, with bearer-token auth.
+
+### Note on version numbers
+
+The fork's `.0/.1` patch suffix train is independent of upstream's release line. Upstream's `[0.22.7]` and `[0.22.8]` are NOT equivalent to the fork's `[0.22.7.0]` and `[0.22.8.0]/[0.22.8.1]` - the fork's entries ship different code at different commits. `[0.22.9.1]` is the first time the fork actually contains upstream's `v0.22.7` and `v0.22.8` changes; this synthesis entry replaces upstream's CHANGELOG sections to keep the fork's audit trail readable.
+
+## To take advantage of v0.22.9.1
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about anything afterwards:
+
+1. **Run the upgrade:**
+   ```bash
+   gbrain upgrade
+   ```
+2. **Verify doctor finishes cleanly (especially relevant if you hit the v0.22.6.x or earlier 60s timeout on Supabase):**
+   ```bash
+   gbrain doctor
+   ```
+3. **If anything looks wrong,** file an issue with `gbrain doctor` output and contents of `~/.gbrain/upgrade-errors.jsonl` if it exists.
+
 ## [0.22.9.0] - 2026-04-29
 
 **pgvector and pg_trgm move out of public so Supabase advisor lint 0014 stops nagging.**
