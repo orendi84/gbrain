@@ -2,6 +2,62 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.22.8.1] - 2026-04-29
+
+**`bun run test:e2e` no longer wedges your autopilot.**
+**HOME isolation in the E2E wrapper, plus a post-run md5 check that fails loud on breach.**
+
+The E2E suite calls paths that resolve to `gbrain init` / `saveConfig` (e.g. setupDB writing config for the test container). Without isolation, those writes landed at the user's real `~/.gbrain/config.json`, repointing the live brain at `localhost:5434/gbrain_test`. When the docker container tore down, the autopilot worker held the original AWS Postgres sockets in memory, then silently failed to reconnect on the next cycle. Three operators hit this in 11 days. After this release, `scripts/run-e2e.sh` exports both `HOME` and `GBRAIN_HOME` to a `mktemp -d` tmpdir before bun starts, traps cleanup on exit, and verifies the user's real config md5 is byte-identical post-run. If a test still escapes the override, the wrapper exits with code 2 and a `HOME isolation breach detected` banner so the breach can never go silent.
+
+Both env vars are required: `loadConfig` / `saveConfig` resolve via `HOME`, while `configPath` / `getDbUrlSource` honor `GBRAIN_HOME`. Setting only one leaves the other path escaping isolation. `HOME` is set before bun starts because Bun's `os.homedir()` caches at first call; in-process mutation can't beat the cache.
+
+### The numbers that matter
+
+Measured against the recurring incident pattern in `~/.gbrain/config.json.*` backup files:
+
+| Metric | Before | After | Δ |
+|---|---|---|---|
+| Config-corruption incidents in last 11 days | 3 | 0 | -3 |
+| Config write surface during E2E | live `~/.gbrain/config.json` | `mktemp -d` tmpdir | scoped |
+| Detection latency on breach | hours (autopilot wedge) | seconds (exit 2) | loud |
+| Cross-platform md5 support | n/a | macOS `md5` + Linux `md5sum` | both |
+
+E2E suite verified end-to-end: 27 files, 245 tests, 0 failures with the wrapper active. User config md5 `bd38fb4bd78f86b0b5092bbf0876d023` identical before and after the run.
+
+### Itemized changes
+
+#### Fixed
+- `scripts/run-e2e.sh`: HOME and GBRAIN_HOME isolation to a tmpdir before bun starts. Trap-based cleanup on any exit path. Post-run md5 verification of the real user config; exit 2 with explicit "HOME isolation breach detected" banner if the md5 changed. Cross-platform md5 fallback (macOS `md5 -q`, Linux `md5sum`).
+- `llms-full.txt`: regenerated via `bun run build:llms` to match the v35 trigger search_path docs annotation in CLAUDE.md. Closes the `test/build-llms.test.ts` drift left by the v0.22.8.0 docs commit.
+
+## To take advantage of v0.22.8.1
+
+`gbrain upgrade` should do this automatically. If you have a checkout of `~/gbrain` and you re-run E2E locally, no further action needed - the wrapper now isolates by default.
+
+1. **Verify the wrapper change is live in your checkout:**
+   ```bash
+   grep -q 'HOME isolation' ~/gbrain/scripts/run-e2e.sh && echo "isolated" || echo "missing"
+   ```
+2. **Verify your live config didn't get clobbered by the last E2E run:**
+   ```bash
+   cat ~/.gbrain/config.json | python3 -c "import json,sys; cfg=json.load(sys.stdin); url=cfg['database_url']; print('OK pooler' if 'pooler.supabase' in url else 'WRONG ' + url.split('@',1)[1][:50])"
+   ```
+   Expected output: `OK pooler`. If you see `WRONG localhost:...`, restore from the most recent `~/.gbrain/config.json.pooler-backup-*` after testing the credential with `psql SELECT 1`.
+3. **Re-run E2E to confirm isolation:**
+   ```bash
+   md5 -q ~/.gbrain/config.json | tee /tmp/before
+   DATABASE_URL=postgresql://postgres:postgres@localhost:5434/gbrain_test bun run test:e2e
+   md5 -q ~/.gbrain/config.json | tee /tmp/after
+   diff /tmp/before /tmp/after && echo "isolated" || echo "BREACH"
+   ```
+   The wrapper does this verification internally too; this is just a second-source check.
+4. **If any step fails or the wrapper exits 2,** please file an issue: https://github.com/garrytan/gbrain/issues with:
+   - output of the md5 diff
+   - the wrapper's stderr
+   - which test triggered the breach (last `=== <test>.test.ts ===` header before the failure)
+
+   The breach detection should never trigger - if it does, a test is escaping HOME and that's a separate bug to track down. Thank you.
+
 ## [0.22.8.0] - 2026-04-29
 
 **Trigger functions get a search_path lock so Supabase advisor lint 0011 stops nagging.**
