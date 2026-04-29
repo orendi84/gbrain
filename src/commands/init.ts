@@ -178,11 +178,15 @@ async function initPostgres(opts: { databaseUrl: string; jsonOutput: boolean; ap
       if (ext.length === 0) {
         console.log('pgvector extension not found. Attempting to create...');
         try {
-          await conn`CREATE EXTENSION IF NOT EXISTS vector`;
+          // v0.22.9.0: install into `extensions` schema, matching the
+          // canonical placement asserted by Supabase advisor lint 0014.
+          await conn`CREATE SCHEMA IF NOT EXISTS extensions`;
+          await conn`CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions`;
           console.log('pgvector extension created successfully.');
         } catch {
           console.error('Could not auto-create pgvector extension. Run manually in SQL Editor:');
-          console.error('  CREATE EXTENSION vector;');
+          console.error('  CREATE SCHEMA IF NOT EXISTS extensions;');
+          console.error('  CREATE EXTENSION vector WITH SCHEMA extensions;');
           // Throw so the outer finally runs engine.disconnect() before we die.
           throw new Error('pgvector extension missing');
         }
